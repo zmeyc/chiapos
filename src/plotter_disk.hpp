@@ -946,10 +946,6 @@ private:
         bool bitfield[2][1 << k];
         memset(&bitfield[0], 1, 1 << k);  // all entries of table 7 are live
 
-        // An extra bit is used, since we may have more than 2^k entries in a table. (After pruning,
-        // each table will have 0.8*2^k or less entries).
-        uint64_t prev_num_entries = 1 << k;
-
         std::vector<uint64_t> bucket_sizes_pos(kNumSortBuckets, 0);
         std::vector<uint64_t> new_table_sizes = std::vector<uint64_t>(8, 0);
         new_table_sizes[7] = table_sizes[7];
@@ -963,7 +959,10 @@ private:
             memset(&bitfield[NXT], 0, 1 << k);
             // From the current bitfield[CUR], we are highlighting bitfield[NXT]
 
-            entry_size_bytes = GetMaxEntrySize(k, table_index, false);
+            // entry_size_bytes = GetMaxEntrySize(k, table_index, false);
+            entry_size_bytes = 2 * k + kOffsetSize;
+            if (table_index == 1)
+                entry_size_bytes = k;
 
             // Try to read from tmp_1_disks[table_index + 1]
             FileDisk& disk = tmp_1_disks[table_index];
@@ -1055,7 +1054,7 @@ private:
                 // Generate position_map checkpoints from bitfield
                 std::unordered_map<uint64_t, uint64_t> bitmap;
                 uint64_t t = 0;
-                for (uint64_t i = 0; i < prev_num_entries; ++i) {
+                for (uint64_t i = 0; i < entry_counter; ++i) {
                     if (bitfield[CUR][i]) {
                         bitmap[t++] = i;
                     }
@@ -1077,7 +1076,7 @@ private:
 
                     for (uint64_t i = 0; i < numEntries; i++) {
                         entry_sort_key = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
-                        entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, k, 2 * k);
+                        entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, k, k);
                         entry_offset =
                             Util::SliceInt64FromBytes(read_buf_cursor, 2 * k, kOffsetSize);
                         new_pos = bitmap[entry_pos];
