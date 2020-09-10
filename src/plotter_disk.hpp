@@ -949,20 +949,18 @@ private:
         std::vector<uint64_t> bucket_sizes_pos(kNumSortBuckets, 0);
         std::vector<uint64_t> new_table_sizes = std::vector<uint64_t>(8, 0);
         new_table_sizes[7] = table_sizes[7];
+        for (int i = 0; i < 8; ++i)
+            std::cout << "Debug [tsize] " << i << " " << table_sizes[i] << std::endl;
         uint64_t entry_size_bytes;
         uint64_t numEntries;
 
-        // Iterates through each table (with a left and right pointer), starting at 6 & 7.
         for (uint8_t table_index = 6; table_index >= 1; table_index--) {
             bool CUR = table_index & 1;  // positions in bitfield[][]
-            bool NXT = 1 - CUR;
+            bool NXT = CUR ^ 1;
             memset(&bitfield[NXT], 0, 1 << k);
             // From the current bitfield[CUR], we are highlighting bitfield[NXT]
 
-            // entry_size_bytes = GetMaxEntrySize(k, table_index, false);
-            entry_size_bytes = 2 * k + kOffsetSize;
-            if (table_index == 1)
-                entry_size_bytes = k;
+            entry_size_bytes = GetMaxEntrySize(k, table_index, false);
 
             // Try to read from tmp_1_disks[table_index + 1]
             FileDisk& disk = tmp_1_disks[table_index];
@@ -1019,11 +1017,12 @@ private:
                     if (table_index >= 2) {
                         entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
                         entry_offset = Util::SliceInt64FromBytes(read_buf_cursor, k, kOffsetSize);
-                        // entry_sort_key =
-                        //     Util::SliceInt64FromBytes(read_buf_ptr, k + kOffsetSize, k + 1);
 
                         if (bitfield[CUR][entry_pos]) {
                             bitfield[NXT][entry_pos] = bitfield[NXT][entry_pos + entry_offset] = 1;
+                            Bits debug_entry = Bits(entry_counter, k) + Bits(entry_pos, k) +
+                                               Bits(entry_offset, kOffsetSize);
+                            std::cout << "Debug[leftentry] " << debug_entry << std::endl;
                             write_to_disk(
                                 Bits(entry_counter, k) + Bits(entry_pos, k) +
                                 Bits(entry_offset, kOffsetSize));
@@ -1032,6 +1031,8 @@ private:
                     } else {
                         entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
                         if (bitfield[CUR][entry_pos]) {
+                            // std::cout << "Debug[leftentry.] " << Bits(entry_counter, k + 1)
+                            //           << std::endl;
                             write_to_disk(Bits(entry_counter, k));
                             entry_counter++;
                         }
@@ -1084,6 +1085,10 @@ private:
                         write_to_disk(
                             Bits(entry_sort_key, k) + Bits(new_pos, k) +
                             Bits(new_offset, kOffsetSize));
+
+                        Bits debug_entry = Bits(entry_sort_key, k) + Bits(new_pos, k) +
+                                           Bits(new_offset, kOffsetSize);
+                        std::cout << "Debug[entry] " << debug_entry << std::endl;
 
                         read_buf_cursor += entry_size_bytes;
                     }
