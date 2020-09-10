@@ -1077,7 +1077,7 @@ private:
 
                     for (uint64_t i = 0; i < numEntries; i++) {
                         entry_sort_key = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
-                        entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, k, 2 * k);
+                        entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, k, k);
                         entry_offset =
                             Util::SliceInt64FromBytes(read_buf_cursor, 2 * k, kOffsetSize);
                         new_pos = bitmap[entry_pos];
