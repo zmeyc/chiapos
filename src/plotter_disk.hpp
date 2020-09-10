@@ -944,7 +944,7 @@ private:
         uint32_t memo_len)
     {
         bool bitfield[2][1 << k];
-        memset(&bitfield[1], 1, 1 << k);  // all entries of table 7 are live
+        memset(&bitfield[0], 1, 1 << k);  // all entries of table 7 are live
 
         // An extra bit is used, since we may have more than 2^k entries in a table. (After pruning,
         // each table will have 0.8*2^k or less entries).
@@ -977,14 +977,14 @@ private:
 
             uint64_t write_wheel = 0;  // number of written entries in buffer, mod num_buf_entries
             uint64_t num_buf_entries = memorySize / 2 / entry_size_bytes;
-            uint64_t remaining_entries = new_table_sizes[table_index];
+            uint64_t remaining_entries = table_sizes[table_index];
             uint64_t entry_sort_key = 0;
             uint64_t entry_pos = 0;
             uint64_t entry_offset = 0;
             uint64_t entry_counter = 0;
 
             auto read_from_disk = [&]() {
-                // Side effects: read_disk_cursor
+                // Side effects: read_disk_ptr
                 // Return: number of entries read
                 uint64_t n_entries = std::min(num_buf_entries, remaining_entries);
                 uint64_t readAmt = n_entries * entry_size_bytes;
@@ -994,7 +994,7 @@ private:
             };
 
             auto write_to_disk = [&](Bits entry) {
-                // Side effects: write_buf_cursor, write_wheel
+                // Side effects: write_buf_cursor, write_disk_ptr, write_wheel
                 entry.ToBytes(write_buf_cursor);
                 write_buf_cursor += entry_size_bytes;
                 if (++write_wheel == num_buf_entries) {  // buffer full, write to disk
@@ -1006,9 +1006,13 @@ private:
                 }
             };
 
+            std::cout << "Debug[entries] " << remaining_entries << std::endl;
             while (remaining_entries) {
                 numEntries = read_from_disk();
                 remaining_entries -= numEntries;
+
+                std::cout << "Debug[entries2] " << remaining_entries << " " << numEntries
+                          << std::endl;
 
                 // Process each entry in read_buf
                 read_buf_cursor = read_buf;
@@ -1024,16 +1028,17 @@ private:
                             write_to_disk(
                                 Bits(entry_counter, k) + Bits(entry_pos, k) +
                                 Bits(entry_offset, kOffsetSize));
+                            entry_counter++;
                         }
                     } else {
                         entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
                         if (bitfield[CUR][entry_pos]) {
                             write_to_disk(Bits(entry_counter, k));
+                            entry_counter++;
                         }
                     }
 
                     read_buf_cursor += entry_size_bytes;
-                    entry_counter++;
                 }
             }
 
@@ -1043,6 +1048,8 @@ private:
                 write_wheel = 0;
                 write_buf_cursor = write_buf;
             }
+
+            std::cout << "Debug [Entry counter] " << entry_counter << std::endl;
 
             if (table_index >= 2) {
                 // Generate position_map checkpoints from bitfield
