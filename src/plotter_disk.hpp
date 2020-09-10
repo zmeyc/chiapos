@@ -1090,7 +1090,6 @@ private:
                 }
             }
 
-            prev_num_entries = entry_counter;
             new_table_sizes[table_index] = entry_counter;
         }
 
