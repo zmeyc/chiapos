@@ -185,8 +185,10 @@ public:
                       << Timer::GetNow();
 
             Timer p2;
+            // std::vector<uint64_t> backprop_table_sizes =
+            //     Backpropagate(memory, tmp_1_disks, table_sizes, k, id, memo, memo_len);
             std::vector<uint64_t> backprop_table_sizes =
-                Backpropagate(memory, tmp_1_disks, table_sizes, k, id, memo, memo_len);
+                Backpropagate_Bitfield(memory, tmp_1_disks, table_sizes, k, id, memo, memo_len);
             p2.PrintElapsed("Time for phase 2 =");
 
             std::cout << std::endl
@@ -941,373 +943,151 @@ private:
         const uint8_t* memo,
         uint32_t memo_len)
     {
+        bool bitfield[2][1 << k];
+        memset(&bitfield[1], 1, 1 << k);  // all entries of table 7 are live
+
         // An extra bit is used, since we may have more than 2^k entries in a table. (After pruning,
         // each table will have 0.8*2^k or less entries).
-        uint8_t pos_size = k;
+        uint64_t prev_num_entries = 1 << k;
 
         std::vector<uint64_t> bucket_sizes_pos(kNumSortBuckets, 0);
         std::vector<uint64_t> new_table_sizes = std::vector<uint64_t>(8, 0);
         new_table_sizes[7] = table_sizes[7];
+        uint64_t entry_size_bytes;
+        uint64_t numEntries;
 
         // Iterates through each table (with a left and right pointer), starting at 6 & 7.
-        for (uint8_t table_index = 7; table_index > 1; --table_index) {
-            // std::vector<std::pair<uint64_t, uint64_t> > match_positions;
-            Timer table_timer;
+        for (uint8_t table_index = 6; table_index >= 1; table_index--) {
+            bool CUR = table_index & 1;  // positions in bitfield[][]
+            bool NXT = 1 - CUR;
+            memset(&bitfield[NXT], 0, 1 << k);
+            // From the current bitfield[CUR], we are highlighting bitfield[NXT]
 
-            std::cout << "Backpropagating on table " << int{table_index} << std::endl;
+            entry_size_bytes = GetMaxEntrySize(k, table_index, false);
 
-            std::vector<uint64_t> new_bucket_sizes_pos(kNumSortBuckets, 0);
+            // Try to read from tmp_1_disks[table_index + 1]
+            FileDisk& disk = tmp_1_disks[table_index];
+            uint64_t read_disk_ptr = 0;
+            uint64_t write_disk_ptr = 0;
 
-            uint16_t left_metadata_size = kVectorLens[table_index] * k;
+            uint8_t* read_buf = &(memory[0]);
+            uint8_t* write_buf = &(memory[memorySize / 2]);
+            uint8_t* read_buf_cursor = read_buf;
+            uint8_t* write_buf_cursor = write_buf;
 
-            // The entry that we are reading (no metadata)
-            uint16_t left_entry_size_bytes = GetMaxEntrySize(k, table_index - 1, false);
+            uint64_t write_wheel = 0;  // number of written entries in buffer, mod num_buf_entries
+            uint64_t num_buf_entries = memorySize / 2 / entry_size_bytes;
+            uint64_t remaining_entries = new_table_sizes[table_index];
+            uint64_t entry_sort_key = 0;
+            uint64_t entry_pos = 0;
+            uint64_t entry_offset = 0;
+            uint64_t entry_counter = 0;
 
-            // The right entries which we read and write (the already have no metadata, since they
-            // have been pruned in previous iteration)
-            uint16_t right_entry_size_bytes = GetMaxEntrySize(k, table_index, false);
+            auto read_from_disk = [&]() {
+                // Side effects: read_disk_cursor
+                // Return: number of entries read
+                uint64_t n_entries = std::min(num_buf_entries, remaining_entries);
+                uint64_t readAmt = n_entries * entry_size_bytes;
+                disk.Read(read_disk_ptr, read_buf, readAmt);
+                read_disk_ptr += readAmt;
+                return n_entries;
+            };
 
-            // Doesn't sort table 7, since it's already sorted by pos6 (position into table 6).
-            // The reason we sort, is so we can iterate through both tables at once. For example,
-            // if we read a right entry (pos, offset) = (456, 2), the next one might be (458, 19),
-            // and in the left table, we are reading entries around pos 450, etc..
-            if (table_index != 7) {
-                std::cout << "\tSorting table " << int{table_index} << std::endl;
-                Timer sort_timer;
-                Sorting::SortOnDisk(
-                    tmp_1_disks[table_index],
-                    0,
-                    tmp_1_disks[0],
-                    right_entry_size_bytes,
-                    0,
-                    bucket_sizes_pos,
-                    memory,
-                    memorySize);
+            auto write_to_disk = [&](Bits entry) {
+                // Side effects: write_buf_cursor, write_wheel
+                entry.ToBytes(write_buf_cursor);
+                write_buf_cursor += entry_size_bytes;
+                if (++write_wheel == num_buf_entries) {  // buffer full, write to disk
+                    write_wheel = 0;
+                    write_buf_cursor = write_buf;
+                    uint64_t writeAmt = num_buf_entries * entry_size_bytes;
+                    disk.Write(write_disk_ptr, write_buf, writeAmt);
+                    write_disk_ptr += writeAmt;
+                }
+            };
 
-                sort_timer.PrintElapsed("\tSort time:");
-            }
-            Timer computation_pass_timer;
+            while (remaining_entries) {
+                numEntries = read_from_disk();
+                remaining_entries -= numEntries;
 
-            uint64_t left_reader = 0;
-            uint64_t left_writer = 0;
-            uint64_t right_reader = 0;
-            uint64_t right_writer = 0;
-            uint8_t* left_reader_buf = &(memory[0]);
-            uint8_t* left_writer_buf = &(memory[memorySize / 4]);
-            uint8_t* right_reader_buf = &(memory[memorySize / 2]);
-            uint8_t* right_writer_buf = &(memory[3 * memorySize / 4]);
-            uint64_t left_buf_entries = memorySize / 4 / left_entry_size_bytes;
-            uint64_t new_left_buf_entries = memorySize / 4 / left_entry_size_bytes;
-            uint64_t right_buf_entries = memorySize / 4 / right_entry_size_bytes;
-            uint64_t left_reader_count = 0;
-            uint64_t right_reader_count = 0;
-            uint64_t left_writer_count = 0;
-            uint64_t right_writer_count = 0;
+                // Process each entry in read_buf
+                read_buf_cursor = read_buf;
+                for (uint64_t i = 0; i < numEntries; i++) {
+                    if (table_index >= 2) {
+                        entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
+                        entry_offset = Util::SliceInt64FromBytes(read_buf_cursor, k, kOffsetSize);
+                        // entry_sort_key =
+                        //     Util::SliceInt64FromBytes(read_buf_ptr, k + kOffsetSize, k + 1);
 
-            // We will divide by 2, so it must be even.
-            assert(kCachedPositionsSize % 2 == 0);
-
-            // Used positions will be used to mark which posL are present in table R, the rest will
-            // be pruned
-            bool used_positions[kCachedPositionsSize];
-            memset(used_positions, 0, sizeof(used_positions));
-
-            bool should_read_entry = true;
-
-            // Cache for when we read a right entry that is too far forward
-            uint64_t cached_entry_sort_key = 0;  // For table_index == 7, y is here
-            uint64_t cached_entry_pos = 0;
-            uint64_t cached_entry_offset = 0;
-
-            uint64_t left_entry_counter = 0;  // Total left entries written
-
-            // Sliding window map, from old position to new position (after pruning)
-            uint64_t new_positions[kCachedPositionsSize];
-
-            // Sort keys represent the ordering of entries, sorted by (y, pos, offset),
-            // but using less bits (only k+1 instead of 2k + 9, etc.)
-            // This is a map from old position to array of sort keys (one for each R entry with this
-            // pos)
-            uint64_t old_sort_keys[kReadMinusWrite][kMaxMatchesSingleEntry];
-            // Map from old position to other positions that it matches with
-            uint64_t old_offsets[kReadMinusWrite][kMaxMatchesSingleEntry];
-            // Map from old position to count (number of times it appears)
-            uint16_t old_counters[kReadMinusWrite];
-
-            for (uint32_t i = 0; i < kReadMinusWrite; i++) {
-                old_counters[i] = 0;
-            }
-
-            bool end_of_right_table = false;
-            uint64_t current_pos =
-                0;  // This is the current pos that we are looking for in the L table
-            uint64_t end_of_table_pos = 0;
-            uint64_t greatest_pos = 0;  // This is the greatest position we have seen in R table
-
-            // Buffers for reading and writing to disk
-            uint8_t* left_entry_buf;
-            uint8_t* new_left_entry_buf;
-            uint8_t* right_entry_buf;
-
-            // Go through all right entries, and keep going since write pointer is behind read
-            // pointer
-            while (!end_of_right_table || (current_pos - end_of_table_pos <= kReadMinusWrite)) {
-                old_counters[current_pos % kReadMinusWrite] = 0;
-
-                // Resets used positions after a while, so we use little memory
-                if ((current_pos - kReadMinusWrite) % (kCachedPositionsSize / 2) == 0) {
-                    if ((current_pos - kReadMinusWrite) % kCachedPositionsSize == 0) {
-                        for (uint32_t i = kCachedPositionsSize / 2; i < kCachedPositionsSize; i++) {
-                            used_positions[i] = false;
+                        if (bitfield[CUR][entry_pos]) {
+                            bitfield[NXT][entry_pos] = bitfield[NXT][entry_pos + entry_offset] = 1;
+                            write_to_disk(
+                                Bits(entry_counter, k) + Bits(entry_pos, k) +
+                                Bits(entry_offset, kOffsetSize));
                         }
                     } else {
-                        for (uint32_t i = 0; i < kCachedPositionsSize / 2; i++) {
-                            used_positions[i] = false;
+                        entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
+                        if (bitfield[CUR][entry_pos]) {
+                            write_to_disk(Bits(entry_counter, k));
                         }
                     }
+
+                    read_buf_cursor += entry_size_bytes;
+                    entry_counter++;
                 }
-                // Only runs this code if we are still reading the right table, or we still need to
-                // read more left table entries (current_pos <= greatest_pos), otherwise, it skips
-                // to the writing of the final R table entries
-                if (!end_of_right_table || current_pos <= greatest_pos) {
-                    uint64_t entry_sort_key = 0;
-                    uint64_t entry_pos = 0;
-                    uint64_t entry_offset = 0;
-
-                    while (!end_of_right_table) {
-                        if (should_read_entry) {
-                            // Need to read another entry at the current position
-                            if (right_reader_count % right_buf_entries == 0) {
-                                uint64_t readAmt = std::min(
-                                    right_buf_entries * right_entry_size_bytes,
-                                    (new_table_sizes[table_index] - right_reader_count) *
-                                        right_entry_size_bytes);
-
-                                tmp_1_disks[table_index].Read(
-                                    right_reader, right_reader_buf, readAmt);
-                                right_reader += readAmt;
-                            }
-                            right_entry_buf =
-                                right_reader_buf +
-                                (right_reader_count % right_buf_entries) * right_entry_size_bytes;
-                            right_reader_count++;
-
-                            if (table_index == 7) {
-                                // This is actually y for table 7
-                                entry_sort_key = Util::SliceInt64FromBytes(right_entry_buf, 0, k);
-                                entry_pos = Util::SliceInt64FromBytes(right_entry_buf, k, pos_size);
-                                entry_offset = Util::SliceInt64FromBytes(
-                                    right_entry_buf, k + pos_size, kOffsetSize);
-                            } else {
-                                entry_pos = Util::SliceInt64FromBytes(right_entry_buf, 0, pos_size);
-                                entry_offset = Util::SliceInt64FromBytes(
-                                    right_entry_buf, pos_size, kOffsetSize);
-                                entry_sort_key = Util::SliceInt64FromBytes(
-                                    right_entry_buf, pos_size + kOffsetSize, k + 1);
-                            }
-                        } else if (cached_entry_pos == current_pos) {
-                            // We have a cached entry at this position
-                            entry_sort_key = cached_entry_sort_key;
-                            entry_pos = cached_entry_pos;
-                            entry_offset = cached_entry_offset;
-                        } else {
-                            // The cached entry is at a later pos, so we don't read any more R
-                            // entries, read more L entries instead.
-                            break;
-                        }
-
-                        should_read_entry = true;  // By default, read another entry
-                        if (entry_pos + entry_offset > greatest_pos) {
-                            // Greatest L pos that we should look for
-                            greatest_pos = entry_pos + entry_offset;
-                        }
-                        if (entry_sort_key == 0 && entry_pos == 0 && entry_offset == 0) {
-                            // Table R has ended, don't read any more (but keep writing)
-                            end_of_right_table = true;
-                            end_of_table_pos = current_pos;
-                            break;
-                        } else if (entry_pos == current_pos) {
-                            // The current L position is the current R entry
-                            // Marks the two matching entries as used (pos and pos+offset)
-                            used_positions[entry_pos % kCachedPositionsSize] = true;
-                            used_positions[(entry_pos + entry_offset) % kCachedPositionsSize] =
-                                true;
-
-                            uint64_t old_write_pos = entry_pos % kReadMinusWrite;
-
-                            // Stores the sort key for this R entry
-                            old_sort_keys[old_write_pos][old_counters[old_write_pos]] =
-                                entry_sort_key;
-
-                            // Stores the other matching pos for this R entry (pos6 + offset)
-                            old_offsets[old_write_pos][old_counters[old_write_pos]] =
-                                entry_pos + entry_offset;
-                            ++old_counters[old_write_pos];
-                        } else {
-                            // Don't read any more right entries for now, because we haven't caught
-                            // up on the left table yet
-                            should_read_entry = false;
-                            cached_entry_sort_key = entry_sort_key;
-                            cached_entry_pos = entry_pos;
-                            cached_entry_offset = entry_offset;
-                            break;
-                        }
-                    }
-                    // ***Reads a left entry
-                    if (left_reader_count % left_buf_entries == 0) {
-                        uint64_t readAmt = std::min(
-                            left_buf_entries * left_entry_size_bytes,
-                            (table_sizes[table_index - 1] - left_reader_count) *
-                                left_entry_size_bytes);
-                        tmp_1_disks[table_index - 1].Read(left_reader, left_reader_buf, readAmt);
-                        left_reader += readAmt;
-                    }
-                    left_entry_buf = left_reader_buf +
-                                     (left_reader_count % left_buf_entries) * left_entry_size_bytes;
-                    left_reader_count++;
-
-                    // If this left entry is used, we rewrite it. If it's not used, we ignore it.
-                    if (used_positions[current_pos % kCachedPositionsSize]) {
-                        uint64_t entry_metadata;
-
-                        if (table_index > 2) {
-                            // For tables 2-6, the entry is: pos, offset
-                            entry_pos = Util::SliceInt64FromBytes(left_entry_buf, 0, pos_size);
-                            entry_offset =
-                                Util::SliceInt64FromBytes(left_entry_buf, pos_size, kOffsetSize);
-                        } else {
-                            entry_metadata =
-                                Util::SliceInt64FromBytes(left_entry_buf, 0, left_metadata_size);
-                        }
-
-                        new_left_entry_buf =
-                            left_writer_buf +
-                            (left_writer_count % new_left_buf_entries) * left_entry_size_bytes;
-                        left_writer_count++;
-
-                        Bits new_left_entry;
-                        if (table_index > 2) {
-                            // The new left entry is slightly different. Metadata is dropped, to
-                            // save space, and the counter of the entry is written (sort_key). We
-                            // use this instead of (y + pos + offset) since its smaller.
-                            new_left_entry += Bits(entry_pos, pos_size);
-                            new_left_entry += Bits(entry_offset, kOffsetSize);
-                            new_left_entry += Bits(left_entry_counter, k + 1);
-
-                            // If we are not taking up all the bits, make sure they are zeroed
-                            if (Util::ByteAlign(new_left_entry.GetSize()) <
-                                left_entry_size_bytes * 8) {
-                                memset(new_left_entry_buf, 0, left_entry_size_bytes);
-                            }
-                        } else {
-                            // For table one entries, we don't care about sort key, only x.
-                            new_left_entry += Bits(entry_metadata, left_metadata_size);
-                        }
-                        new_left_entry.ToBytes(new_left_entry_buf);
-
-                        if (left_writer_count % new_left_buf_entries == 0) {
-                            tmp_1_disks[table_index - 1].Write(
-                                left_writer,
-                                left_writer_buf,
-                                new_left_buf_entries * left_entry_size_bytes);
-                            left_writer += new_left_buf_entries * left_entry_size_bytes;
-                        }
-
-                        new_bucket_sizes_pos[SortOnDiskUtils::ExtractNum(
-                            new_left_entry_buf, left_entry_size_bytes, 0, kLogNumSortBuckets)] += 1;
-                        // Mapped positions, so we can rewrite the R entry properly
-                        new_positions[current_pos % kCachedPositionsSize] = left_entry_counter;
-
-                        // Counter for new left entries written
-                        ++left_entry_counter;
-                    }
-                }
-                // Write pointer lags behind the read pointer
-                int64_t write_pointer_pos = current_pos - kReadMinusWrite + 1;
-
-                // Only write entries for write_pointer_pos, if we are above 0, and there are
-                // actually R entries for that pos.
-                if (write_pointer_pos >= 0 &&
-                    used_positions[write_pointer_pos % kCachedPositionsSize]) {
-                    uint64_t new_pos = new_positions[write_pointer_pos % kCachedPositionsSize];
-                    Bits new_pos_bin(new_pos, pos_size);
-                    // There may be multiple R entries that share the write_pointer_pos, so write
-                    // all of them
-                    for (uint32_t counter = 0;
-                         counter < old_counters[write_pointer_pos % kReadMinusWrite];
-                         counter++) {
-                        // Creates and writes the new right entry, with the cached data
-                        uint64_t new_offset_pos = new_positions
-                            [old_offsets[write_pointer_pos % kReadMinusWrite][counter] %
-                             kCachedPositionsSize];
-                        Bits new_right_entry =
-                            table_index == 7
-                                ? Bits(
-                                      old_sort_keys[write_pointer_pos % kReadMinusWrite][counter],
-                                      k)
-                                : Bits(
-                                      old_sort_keys[write_pointer_pos % kReadMinusWrite][counter],
-                                      k + 1);
-                        new_right_entry += new_pos_bin;
-                        // match_positions.push_back(std::make_pair(new_pos, new_offset_pos));
-                        new_right_entry.AppendValue(new_offset_pos - new_pos, kOffsetSize);
-
-                        // Calculate right entry pointer for output
-                        right_entry_buf =
-                            right_writer_buf +
-                            (right_writer_count % right_buf_entries) * right_entry_size_bytes;
-                        right_writer_count++;
-
-                        if (Util::ByteAlign(new_right_entry.GetSize()) <
-                            right_entry_size_bytes * 8) {
-                            memset(right_entry_buf, 0, right_entry_size_bytes);
-                        }
-                        new_right_entry.ToBytes(right_entry_buf);
-
-                        // Check for write out to disk
-                        if (right_writer_count % right_buf_entries == 0) {
-                            tmp_1_disks[table_index].Write(
-                                right_writer,
-                                right_writer_buf,
-                                right_buf_entries * right_entry_size_bytes);
-                            right_writer += right_buf_entries * right_entry_size_bytes;
-                        }
-                    }
-                }
-                ++current_pos;
             }
-            new_table_sizes[table_index - 1] = left_entry_counter + 1;
 
-            std::cout << "\tWrote left entries: " << left_entry_counter << std::endl;
-            computation_pass_timer.PrintElapsed("\tComputation pass time:");
-            table_timer.PrintElapsed("Total backpropagation time::");
+            if (write_wheel) {  // flush write buffer
+                disk.Write(write_disk_ptr, write_buf, write_wheel * entry_size_bytes);
+                write_disk_ptr += write_wheel * entry_size_bytes;
+                write_wheel = 0;
+                write_buf_cursor = write_buf;
+            }
 
-            tmp_1_disks[table_index].Write(
-                right_writer,
-                right_writer_buf,
-                (right_writer_count % right_buf_entries) * right_entry_size_bytes);
-            right_writer += (right_writer_count % right_buf_entries) * right_entry_size_bytes;
+            if (table_index >= 2) {
+                // Generate position_map checkpoints from bitfield
+                std::unordered_map<uint64_t, uint64_t> bitmap;
+                uint64_t t = 0;
+                for (uint64_t i = 0; i < prev_num_entries; ++i) {
+                    if (bitfield[CUR][i]) {
+                        bitmap[t++] = i;
+                    }
+                }
 
-            // Writes the 0 entry (EOT) for right table
-            memset(right_writer_buf, 0x00, right_entry_size_bytes);
-            tmp_1_disks[table_index].Write(right_writer, right_writer_buf, right_entry_size_bytes);
-            right_writer += right_entry_size_bytes;
-            tmp_1_disks[table_index].Truncate(right_writer);
+                assert(t == entry_counter);
 
-            tmp_1_disks[table_index - 1].Write(
-                left_writer,
-                left_writer_buf,
-                (left_writer_count % new_left_buf_entries) * left_entry_size_bytes);
-            left_writer += (left_writer_count % new_left_buf_entries) * left_entry_size_bytes;
+                // For each entry in disk[t], rewrite entry
+                remaining_entries = entry_counter;
+                read_disk_ptr = 0;
+                write_disk_ptr = 0;
+                read_buf_cursor = read_buf;
+                write_buf_cursor = write_buf;
+                uint64_t new_pos, new_offset;
 
-            // Writes the 0 entry (EOT) for left table
-            memset(left_writer_buf, 0x00, left_entry_size_bytes);
-            tmp_1_disks[table_index - 1].Write(left_writer, left_writer_buf, left_entry_size_bytes);
-            left_writer += left_entry_size_bytes;
-            tmp_1_disks[table_index - 1].Truncate(left_writer);
+                while (remaining_entries) {
+                    numEntries = read_from_disk();
+                    remaining_entries -= numEntries;
 
-            bucket_sizes_pos = new_bucket_sizes_pos;
+                    for (uint64_t i = 0; i < numEntries; i++) {
+                        entry_sort_key = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
+                        entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, k, 2 * k);
+                        entry_offset =
+                            Util::SliceInt64FromBytes(read_buf_cursor, 2 * k, kOffsetSize);
+                        new_pos = bitmap[entry_pos];
+                        new_offset = bitmap[entry_offset];
+                        write_to_disk(
+                            Bits(entry_sort_key, k) + Bits(new_pos, k) +
+                            Bits(new_offset, kOffsetSize));
+
+                        read_buf_cursor += entry_size_bytes;
+                    }
+                }
+            }
+
+            prev_num_entries = entry_counter;
+            new_table_sizes[table_index] = entry_counter;
         }
+
         return new_table_sizes;
     }
 
