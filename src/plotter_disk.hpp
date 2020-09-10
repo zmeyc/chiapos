@@ -1054,7 +1054,7 @@ private:
                 // Generate position_map checkpoints from bitfield
                 std::unordered_map<uint64_t, uint64_t> bitmap;
                 uint64_t t = 0;
-                for (uint64_t i = 0; i < entry_counter; ++i) {
+                for (uint64_t i = 0; i < table_sizes[table_index]; ++i) {
                     if (bitfield[CUR][i]) {
                         bitmap[t++] = i;
                     }
