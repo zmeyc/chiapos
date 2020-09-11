@@ -300,7 +300,8 @@ public:
             case 1:
                 // Represents f1, x
                 if (phase_1_size) {
-                    return Util::ByteAlign(k + kExtraBits + k) / 8;
+                    return Util::ByteAlign(k) / 8;
+                    // return Util::ByteAlign(k + kExtraBits + k) / 8;
                 } else {
                     // After computing matches, table 1 is rewritten without the f1, which
                     // is useless after phase1.
@@ -445,7 +446,9 @@ private:
         std::cout << "Computing table 1" << std::endl;
         Timer f1_start_time;
         F1Calculator f1(k, id);
+        SortOnDiskUtils::F1Calc = f1;
         uint64_t x = 0;
+        x++;  // If we use [1..2**k - 1] instead
 
         uint32_t entry_size_bytes = GetMaxEntrySize(k, 1, true);
 
@@ -474,9 +477,10 @@ private:
 
             for (uint64_t lp = 0; lp < (((uint64_t)1) << (k - kBatchSizes)); lp++) {
                 uint64_t count0 = (x * (uint128_t)k) / kF1BlockSizeBits;
-                uint64_t count1 = (x + (uint128_t)num_eval + 1) * k / kF1BlockSizeBits;
+                uint64_t count1 =
+                    (x + (uint128_t)num_eval + (x == 1 ? 0 : 1)) * k / kF1BlockSizeBits;
                 uint16_t start_bit = (x * (uint128_t)k) % kF1BlockSizeBits;
-                uint64_t x2 = x + num_eval;
+                uint64_t x2 = x + num_eval + (x == 1 ? -1 : 0);
                 t = 0;
                 while (count0 <= count1) {
                     chacha8_get_keystream(&enc_ctx, count0++, 1, ciphertext_bytes);
@@ -486,6 +490,32 @@ private:
 
                 t = 0;
                 for (; x < x2; x++) {
+                    // New way: only write L to disk, and bucket_sizes[y.Slice(0, klog)]++
+                    Bits(x, k).ToBytes(buf);
+                    tmp_1_disks[1].Write(plot_file, (buf), entry_size_bytes);
+                    plot_file += entry_size_bytes;
+
+                    if (start_bit + k < kF1BlockSizeBits) {
+                        bucket_sizes[blocks[t]
+                                         .Slice(start_bit, start_bit + kLogNumSortBuckets)
+                                         .GetValue()]++;
+                    } else {
+                        if (start_bit + kLogNumSortBuckets < kF1BlockSizeBits) {
+                            bucket_sizes[blocks[t]
+                                             .Slice(start_bit, start_bit + kLogNumSortBuckets)
+                                             .GetValue()]++;
+                        } else {
+                            bucket_sizes[(blocks[t].Slice(start_bit) +
+                                          blocks[t + 1].Slice(
+                                              0,
+                                              kLogNumSortBuckets - (kF1BlockSizeBits - start_bit)))
+                                             .GetValue()]++;
+                        }
+                        t++;
+                    }
+
+                    /* Below: old way
+
                     Bits L_bits = Bits(x, k);
                     // Takes the first kExtraBits bits from the input, and adds zeroes if it's not
                     // enough
@@ -514,6 +544,7 @@ private:
                             buf, entry_size_bytes, 0, kLogNumSortBuckets)] += 1;
                         t++;
                     }
+                    */
 
                     // Start bit of the output slice in the current block
                     start_bit += k;
@@ -568,7 +599,9 @@ private:
                 0,
                 bucket_sizes,
                 memory,
-                memorySize);
+                memorySize,
+                0,
+                table_index == 1);
             if (spare_written > max_spare_written) {
                 max_spare_written = spare_written;
             }

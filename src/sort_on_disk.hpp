@@ -73,7 +73,7 @@ public:
 
     // This is used to virtually prepend F1Calc.caclulateF(entry)
     // when comparing two entries.
-    static F1Calculator F1Calc;
+    inline static F1Calculator F1Calc;
     inline static int MemCmpBitsF1(uint8_t* left_arr, uint8_t* right_arr, uint32_t len)
     {
         Bits left_prepend = F1Calc.CalculateF(left_arr, 0);
@@ -244,7 +244,8 @@ public:
         uint32_t entry_len,
         uint32_t bits_begin,
         uint32_t bucket_log,
-        uint64_t entries_per_seg)
+        uint64_t entries_per_seg,
+        bool virtual_f1 = false)
     {
         mem_ = mem;
         mem_len_ = mem_len;
@@ -252,6 +253,7 @@ public:
         bits_begin_ = bits_begin;
         bucket_log_ = bucket_log;
         entries_per_seg_ = entries_per_seg;
+        virtual_f1_ = virtual_f1;
 
         for (uint64_t i = 0; i < (1UL << bucket_log); i++) {
             bucket_sizes_.push_back(0);
@@ -332,7 +334,13 @@ public:
     {
         assert(new_val_len == entry_len_);
         assert(first_empty_seg_id_ != length_);
-        uint64_t b = SortOnDiskUtils::ExtractNum(new_val, new_val_len, bits_begin_, bucket_log_);
+        uint64_t b;
+        if (virtual_f1_) {
+            b = (SortOnDiskUtils::F1Calc).CalculateF(new_val, 0).GetValue();
+            b >>= (SortOnDiskUtils::F1Calc).k_ + kExtraBits - bucket_log_;
+        } else {
+            SortOnDiskUtils::ExtractNum(new_val, new_val_len, bits_begin_, bucket_log_);
+        }
         bucket_sizes_[b] += 1;
 
         // If bucket b contains no segments, or the head segment of bucket b is full, append a new
@@ -500,6 +508,7 @@ private:
     uint32_t entry_len_;
     uint32_t bucket_log_;
     uint64_t entries_per_seg_;
+    bool virtual_f1_;
     std::vector<uint64_t> bucket_sizes_;
     uint64_t seg_size_;
     uint64_t length_;
@@ -554,7 +563,8 @@ public:
         std::vector<uint64_t> bucket_sizes,
         uint8_t* mem,
         uint64_t mem_len,
-        int quicksort = 0)
+        int quicksort = 0,
+        bool virtual_f1 = false)
     {
         spare.Truncate(0);
         uint64_t length = mem_len / entry_len;
@@ -631,7 +641,8 @@ public:
         }
 
         uint64_t spare_consumed = 0;
-        BucketStore bstore = BucketStore(mem, mem_len, entry_len, bits_begin, bucket_log, 100);
+        BucketStore bstore =
+            BucketStore(mem, mem_len, entry_len, bits_begin, bucket_log, 100, virtual_f1);
         uint64_t read_pos = 0;
 
         uint8_t* buf = new uint8_t[entry_len];
@@ -883,6 +894,121 @@ public:
         delete[] swap_space;
         delete[] buffer;
         delete[] common_prefix;
+    }
+
+    inline static void SortInMemoryF1(
+        Disk& disk,
+        uint64_t disk_begin,
+        uint8_t* memory,
+        uint32_t entry_len,
+        uint64_t num_entries,
+        uint32_t bits_begin)
+    {
+        uint32_t entry_len_memory = entry_len;
+        uint64_t memory_len = SortOnDiskUtils::RoundSize(num_entries) * entry_len_memory;
+
+        uint8_t* swap_space = new uint8_t[entry_len];
+        uint8_t* buffer = new uint8_t[BUF_SIZE];
+        uint64_t bucket_length = 0;
+        while ((1ULL << bucket_length) < 2 * num_entries) bucket_length++;
+        memset(memory, 0, sizeof(memory[0]) * memory_len);
+
+        uint64_t read_pos = disk_begin;
+        uint64_t buf_size = 0;
+        uint64_t buf_ptr = 0;
+        // std::vector<bool> mem_mask(SortOnDiskUtils::RoundSize(num_entries) + 1);
+        // bitset<BUF_SIZE> buf_mask;
+        // uint64_t buf_mask_ptr = 0;
+        // bool temp_bit;
+
+        for (uint64_t i = 0; i < num_entries; i++) {
+            if (buf_size == 0) {
+                // If read buffer is empty, read from disk and refill it.
+                buf_size = std::min((uint64_t)BUF_SIZE / entry_len, num_entries - i);
+                buf_ptr = 0;
+                disk.Read(read_pos, buffer, buf_size * entry_len);
+                read_pos += buf_size * entry_len;
+
+                // buf_mask_ptr = 0;
+                // buf_mask.set();
+            }
+            buf_size--;
+            // First unique bits in the entry give the expected position of it in the
+            // sorted array. We take 'bucket_length' bits starting with the first unique
+            // one.
+            // uint64_t base_pos = (*F1Calc).CalculateF(buffer + buf_ptr, 0).GetValue();
+            // base_pos >>= ((*F1Calc).k_ + kExtraBits - bucket_length);
+            // uint64_t pos = base_pos * entry_len_memory;
+            uint64_t pos = ((SortOnDiskUtils::F1Calc).CalculateF(buffer + buf_ptr, 0).GetValue() >>
+                            ((SortOnDiskUtils::F1Calc).k_ + kExtraBits - bucket_length)) *
+                           entry_len_memory;
+
+            // As long as position is occupied by a previous entry...
+            // while (mem_mask[base_pos] == 1 && pos < memory_len) {
+            while (SortOnDiskUtils::IsPositionEmpty(memory + pos, entry_len_memory) == false &&
+                   pos < memory_len) {
+                // ...store there the minimum between the two and continue to push the
+                // higher one.
+
+                if (SortOnDiskUtils::MemCmpBitsF1(
+                        memory + pos, buffer + buf_ptr, entry_len_memory) > 0) {
+                    // We always store the entry without the common prefix.
+                    memcpy(swap_space, memory + pos, entry_len_memory);
+                    memcpy(memory + pos, buffer + buf_ptr, entry_len_memory);
+                    memcpy(buffer + buf_ptr, swap_space, entry_len_memory);
+
+                    // temp_bit = mem_mask[base_pos];
+                    // mem_mask[base_pos] = buf_mask[buf_mask_ptr];
+                    // buf_mask[buf_mask_ptr] = temp_bit;
+                }
+
+                pos += entry_len_memory;
+                // base_pos++;
+            }
+            // Push the entry in the first free spot.
+            memcpy(memory + pos, buffer + buf_ptr, entry_len_memory);
+            buf_ptr += entry_len;
+
+            // mem_mask[base_pos] = 1;
+            // buf_mask[buf_mask_ptr++] = 0;
+        }
+
+        uint64_t entries_written = 0;
+        buf_size = 0;
+        memset(buffer, 0, BUF_SIZE);
+        uint64_t write_pos = disk_begin;
+        // Search the memory buffer for occupied entries.
+
+        // for (uint64_t pos = 0, mem_mask_ptr = 0; entries_written < num_entries && pos <
+        // memory_len;
+        //      pos += entry_len_memory, mem_mask_ptr++) {
+        //     if (mem_mask[mem_mask_ptr] == 1) {
+        for (uint64_t pos = 0; entries_written < num_entries && pos < memory_len;
+             pos += entry_len_memory) {
+            if (SortOnDiskUtils::IsPositionEmpty(memory + pos, entry_len_memory) == false) {
+                // We've found an entry.
+                if (buf_size + entry_len >= BUF_SIZE) {
+                    // Write buffer is full, write it and clean it.
+                    disk.Write(write_pos, buffer, buf_size);
+                    write_pos += buf_size;
+                    entries_written += buf_size / entry_len;
+                    buf_size = 0;
+                }
+                // Then the stored entry itself.
+                memcpy(buffer + buf_size, memory + pos, entry_len_memory);
+                buf_size += entry_len;
+            }
+        }
+
+        if (buf_size > 0) {
+            disk.Write(write_pos, buffer, buf_size);
+            write_pos += buf_size;
+            entries_written += buf_size / entry_len;
+        }
+
+        assert(entries_written == num_entries);
+        delete[] swap_space;
+        delete[] buffer;
     }
 
     inline static void QuickSort(
