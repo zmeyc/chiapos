@@ -71,6 +71,25 @@ public:
         return 0;
     }
 
+    // This is used to virtually prepend F1Calc.caclulateF(entry)
+    // when comparing two entries.
+    static F1Calculator F1Calc;
+    inline static int MemCmpBitsF1(uint8_t* left_arr, uint8_t* right_arr, uint32_t len)
+    {
+        Bits left_prepend = F1Calc.CalculateF(left_arr, 0);
+        Bits right_prepend = F1Calc.CalculateF(right_arr, 0);
+
+        int cmp = Compare(left_prepend, right_prepend);
+        if (cmp)
+            return cmp;
+
+        for (uint32_t i = 0; i < len; i++) {
+            if (left_arr[i] != right_arr[i])
+                return left_arr[i] - right_arr[i];
+        }
+        return 0;
+    }
+
     // The number of memory entries required to do the custom SortInMemory algorithm, given the
     // total number of entries to be sorted.
     inline static uint64_t RoundSize(uint64_t size)
