@@ -513,39 +513,6 @@ private:
                         }
                         t++;
                     }
-
-                    /* Below: old way
-
-                    Bits L_bits = Bits(x, k);
-                    // Takes the first kExtraBits bits from the input, and adds zeroes if it's not
-                    // enough
-                    Bits extra_data = L_bits.Slice(0, kExtraBits);
-                    if (extra_data.GetSize() < kExtraBits) {
-                        extra_data = extra_data + Bits(0, kExtraBits - extra_data.GetSize());
-                    }
-
-                    if (start_bit + k < kF1BlockSizeBits) {
-                        // Everything can be sliced from the current block
-                        (blocks[t].Slice(start_bit, start_bit + k) + extra_data + L_bits)
-                            .ToBytes(buf);
-                        tmp_1_disks[1].Write(plot_file, (buf), entry_size_bytes);
-                        plot_file += entry_size_bytes;
-                        bucket_sizes[SortOnDiskUtils::ExtractNum(
-                            buf, entry_size_bytes, 0, kLogNumSortBuckets)] += 1;
-                    } else {
-                        // Must move forward one block
-                        ((blocks[t].Slice(start_bit) +
-                          blocks[t + 1].Slice(0, k - kF1BlockSizeBits + start_bit)) +
-                         (extra_data + L_bits))
-                            .ToBytes(buf);
-                        tmp_1_disks[1].Write(plot_file, (buf), entry_size_bytes);
-                        plot_file += entry_size_bytes;
-                        bucket_sizes[SortOnDiskUtils::ExtractNum(
-                            buf, entry_size_bytes, 0, kLogNumSortBuckets)] += 1;
-                        t++;
-                    }
-                    */
-
                     // Start bit of the output slice in the current block
                     start_bit += k;
                     start_bit %= kF1BlockSizeBits;
@@ -670,9 +637,13 @@ private:
 
                 if (table_index == 1) {
                     // For table 1, we only have y and metadata
-                    left_entry.y = Util::SliceInt64FromBytes(left_buf, 0, k + kExtraBits);
                     left_entry.left_metadata =
-                        Util::SliceInt64FromBytes(left_buf, k + kExtraBits, metadata_size);
+                        Util::SliceInt64FromBytes(left_buf, 0, metadata_size);
+                    if (left_entry.left_metadata) {
+                        left_entry.y = SortOnDiskUtils::F1Calc.CalculateF(left_buf, 0).GetValue();
+                    } else {
+                        left_entry.y = 0;
+                    }
                 } else {
                     // For tables 2-6, we we also have pos and offset. We need to read this because
                     // this entry will be written again to the table without the y (and some entries

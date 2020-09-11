@@ -596,7 +596,11 @@ public:
         // (number of entries required * entry_len_memory) <= total memory available
         if (quicksort == 0 &&
             SortOnDiskUtils::RoundSize(total_size) * entry_len_memory <= mem_len) {
-            SortInMemory(disk, disk_begin, mem, entry_len, total_size, bits_begin);
+            if (virtual_f1) {
+                SortInMemoryF1(disk, disk_begin, mem, entry_len, total_size, bits_begin);
+            } else {
+                SortInMemory(disk, disk_begin, mem, entry_len, total_size, bits_begin);
+            }
             return 0;
         }
 
@@ -606,9 +610,9 @@ public:
 
         // The beginning of each bucket. The first entry from bucket i will always be written on
         // disk on position disk_begin + bucket_begins[i] * entry_len, the second one will be
-        // written on position disk_begin + (bucket_begins[i] + 1) * entry_len and so on. This way,
-        // when all entries are written back to disk, they will be sorted by the first 4 bits (the
-        // bucket) at the end.
+        // written on position disk_begin + (bucket_begins[i] + 1) * entry_len and so on. This
+        // way, when all entries are written back to disk, they will be sorted by the first 4
+        // bits (the bucket) at the end.
         for (uint64_t i = 0; i < N_buckets - 1; i++) {
             total += bucket_sizes[i];
             bucket_begins.push_back(total);
@@ -655,9 +659,9 @@ public:
             spare_consumed += 1;
         }
 
-        // subbuckets[i][j] represents how many entries starting with prefix i has the next prefix
-        // equal to j. When we'll call recursively for all entries starting with the prefix i,
-        // bucket_sizes[] becomes subbucket_sizes[i].
+        // subbuckets[i][j] represents how many entries starting with prefix i has the next
+        // prefix equal to j. When we'll call recursively for all entries starting with the
+        // prefix i, bucket_sizes[] becomes subbucket_sizes[i].
         std::vector<uint64_t> written_per_bucket(N_buckets, 0);
         std::vector<std::vector<uint64_t> > subbucket_sizes;
         for (uint64_t i = 0; i < N_buckets; i++) {
@@ -676,8 +680,9 @@ public:
                 uint64_t write_pos =
                     disk_begin + (bucket_begins[b] + written_per_bucket[b]) * entry_len;
                 uint64_t size;
-                // Don't extract from the bucket more entries than the difference between read and
-                // written entries (this avoids overwritting entries that were not read yet).
+                // Don't extract from the bucket more entries than the difference between read
+                // and written entries (this avoids overwritting entries that were not read
+                // yet).
                 uint64_t* bucket_handle =
                     bstore.BucketHandle(b, consumed_per_bucket[b] - written_per_bucket[b], size);
                 uint32_t entry_size = entry_len / 8;
@@ -697,10 +702,11 @@ public:
                 delete[] bucket_handle;
             }
 
-            // Advance the read handle into buckets and move read entries to BucketStore. We read
-            // first from buckets with the smallest difference between read and write handles. The
-            // goal is to increase the smaller differences. The bigger the difference is, the
-            // better, as in the next step, we'll be able to extract more from the BucketStore.
+            // Advance the read handle into buckets and move read entries to BucketStore. We
+            // read first from buckets with the smallest difference between read and write
+            // handles. The goal is to increase the smaller differences. The bigger the
+            // difference is, the better, as in the next step, we'll be able to extract more
+            // from the BucketStore.
             std::vector<uint64_t> idx(bucket_sizes.size());
             iota(idx.begin(), idx.end(), 0);
             sort(
@@ -776,11 +782,11 @@ public:
                     new_quicksort = 2;
                 }
             }
-            // At this point, all entries are sorted in increasing order by their buckets (4 bits
-            // prefixes). We recursively sort each chunk, this time starting with the next 4 bits to
-            // determine the buckets. (i.e. firstly, we sort entries starting with 0000, then
-            // entries starting with 0001, ..., then entries starting with 1111, at the end
-            // producing the correct ordering).
+            // At this point, all entries are sorted in increasing order by their buckets (4
+            // bits prefixes). We recursively sort each chunk, this time starting with the next
+            // 4 bits to determine the buckets. (i.e. firstly, we sort entries starting with
+            // 0000, then entries starting with 0001, ..., then entries starting with 1111, at
+            // the end producing the correct ordering).
             uint64_t bytes_written = SortOnDisk(
                 disk,
                 disk_begin + bucket_begins[i] * entry_len,
@@ -790,7 +796,8 @@ public:
                 subbucket_sizes[i],
                 mem,
                 mem_len,
-                new_quicksort);
+                new_quicksort,
+                virtual_f1);
             // Keeps track of how much spare space we used for sorting
             if (bytes_written > max_spare_written) {
                 max_spare_written = bytes_written;
@@ -837,15 +844,16 @@ public:
                 }
             }
             buf_size--;
-            // First unique bits in the entry give the expected position of it in the sorted array.
-            // We take 'bucket_length' bits starting with the first unique one.
+            // First unique bits in the entry give the expected position of it in the sorted
+            // array. We take 'bucket_length' bits starting with the first unique one.
             uint64_t pos = SortOnDiskUtils::ExtractNum(
                                buffer + buf_ptr, entry_len, bits_begin, bucket_length) *
                            entry_len_memory;
             // As long as position is occupied by a previous entry...
             while (SortOnDiskUtils::IsPositionEmpty(memory + pos, entry_len_memory) == false &&
                    pos < memory_len) {
-                // ...store there the minimum between the two and continue to push the higher one.
+                // ...store there the minimum between the two and continue to push the higher
+                // one.
                 if (SortOnDiskUtils::MemCmpBits(
                         memory + pos, buffer + buf_ptr + bits_begin / 8, entry_len_memory, 0) > 0) {
                     // We always store the entry without the common prefix.
