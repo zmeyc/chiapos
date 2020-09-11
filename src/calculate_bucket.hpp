@@ -148,6 +148,62 @@ public:
         return output_bits + extra_data;
     }
 
+    // Performs one evaluation of the F function on input L of k bits.
+    // L is given by buffer[start_bit: start_bit + k_]
+    inline Bits CalculateF(const uint8_t* buffer, const uint32_t start_bit) const
+    {
+        uint16_t num_output_bits = k_;
+        uint16_t block_size_bits = kF1BlockSizeBits;
+        uint64_t L_value = Util::SliceInt64FromBytes(buffer, start_bit, k_);
+
+        // Calculates the counter that will be used to get ChaCha8 keystream.
+        // Since k < block_size_bits, we can fit several k bit blocks into one
+        // ChaCha8 block.
+        uint128_t counter_bit = L_value * (uint128_t)num_output_bits;
+        uint64_t counter = counter_bit / block_size_bits;
+
+        // How many bits are before L, in the current block
+        uint32_t bits_before_L = counter_bit % block_size_bits;
+
+        // How many bits of L are in the current block (the rest are in the next block)
+        const uint16_t bits_of_L =
+            std::min((uint16_t)(block_size_bits - bits_before_L), num_output_bits);
+
+        // True if L is divided into two blocks, and therefore 2 ChaCha8
+        // keystream blocks will be generated.
+        const bool spans_two_blocks = bits_of_L < num_output_bits;
+
+        uint8_t ciphertext_bytes[kF1BlockSizeBits / 8];
+        Bits output_bits;
+
+        // This counter is used to initialize words 12 and 13 of ChaCha8
+        // initial state (4x4 matrix of 32-bit words). This is similar to
+        // encrypting plaintext at a given offset, but we have no
+        // plaintext, so no XORing at the end.
+        chacha8_get_keystream(&this->enc_ctx_, counter, 1, ciphertext_bytes);
+        Bits ciphertext0(ciphertext_bytes, block_size_bits / 8, block_size_bits);
+
+        if (spans_two_blocks) {
+            // Performs another encryption if necessary
+            ++counter;
+            chacha8_get_keystream(&this->enc_ctx_, counter, 1, ciphertext_bytes);
+            Bits ciphertext1(ciphertext_bytes, block_size_bits / 8, block_size_bits);
+            output_bits = ciphertext0.Slice(bits_before_L) +
+                          ciphertext1.Slice(0, num_output_bits - bits_of_L);
+        } else {
+            output_bits = ciphertext0.Slice(bits_before_L, bits_before_L + num_output_bits);
+        }
+
+        // Adds the first few bits of L to the end of the output, production k + kExtraBits of
+        // output
+        // Bits extra_data = L.Slice(0, kExtraBits);
+        Bits extra_data = Bits(L_value >> (k_ - kExtraBits), kExtraBits);
+        if (extra_data.GetSize() < kExtraBits) {
+            extra_data += Bits(0, kExtraBits - extra_data.GetSize());
+        }
+        return output_bits + extra_data;
+    }
+
     // Returns an evaluation of F1(L), and the metadata (L) that must be stored to evaluate F2.
     inline std::pair<Bits, Bits> CalculateBucket(const Bits& L) const
     {
@@ -219,10 +275,10 @@ public:
         return results;
     }
 
-private:
     // Size of the plot
     uint8_t k_;
 
+private:
     // ChaCha8 context
     struct chacha8_ctx enc_ctx_;
 };

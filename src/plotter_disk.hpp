@@ -450,7 +450,6 @@ private:
         uint32_t entry_size_bytes = GetMaxEntrySize(k, 1, true);
 
         // The max value our input (x), can take. A proof of space is 64 of these x values.
-        uint64_t max_value = ((uint64_t)1 << (k)) - 1;
         uint8_t buf[14];
 
         // These are used for sorting on disk. The sort on disk code needs to know how
