@@ -586,6 +586,8 @@ public:
     friend BitsGeneric<X> operator<<(BitsGeneric<X> lhs, uint32_t shift_amount);
     template <class X>
     friend BitsGeneric<X> operator>>(BitsGeneric<X> lhs, uint32_t shift_amount);
+    template <class X>
+    friend int Compare(BitsGeneric<X>& self, BitsGeneric<X>& other);
 
 private:
     static void SplitNumberByPrefix(
@@ -718,6 +720,21 @@ BitsGeneric<T> operator>>(BitsGeneric<T> lhs, uint32_t shift_amount)
         result.AppendValue(new_value, new_length);
     }
     return result;
+}
+
+template <class T>
+int Compare(BitsGeneric<T>& self, BitsGeneric<T>& other)
+{
+    if (self.GetSize() != other.GetSize()) {
+        return other.GetSize() - self.GetSize();
+    }
+
+    for (uint32_t i = 0; i < self.values_.size(); i++) {
+        if (self.values_[i] != other.values_[i]) {
+            return self.values_[i] - other.values_[i];
+        }
+    }
+    return 0;
 }
 
 typedef std::vector<uint64_t> LargeVector;
