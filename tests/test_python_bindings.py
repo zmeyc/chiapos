@@ -83,10 +83,15 @@ class TestPythonBindings(unittest.TestCase):
             for byte_block in iter(lambda: f.read(4096), b""):
                 sha256_plot_hash.update(byte_block)
             plot_hash = str(sha256_plot_hash.hexdigest())
-        assert (
-            plot_hash
-            == "80e32f560f3a4347760d6baae8d16fbaf484948088bff05c51bdcc24b7bc40d9"
+
+        # When starting with a table of [1, 2^k - 1] instead of [0, 2^k],
+        # a few final proofs that use 0 are missing.
+        # all_entries = "80e32f560f3a4347760d6baae8d16fbaf484948088bff05c51bdcc24b7bc40d9"
+        missing_zero_entries = (
+            "1863ab783e5eb1cf9cd6e7ecd434b93ddaf30096ba5dfaceeacd53e245e4a8e5"
         )
+        assert plot_hash == missing_zero_entries
+
         print(f"\nPlotfile asserted sha256: {plot_hash}\n")
         Path("myplot.dat").unlink()
 
