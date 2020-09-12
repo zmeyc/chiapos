@@ -171,32 +171,36 @@ public:
             uint8_t* memory = new uint8_t[memorySize]();
 
             std::cout << std::endl
-                      << "Starting phase 1/4: Forward Propagation into tmp files... "
+                      << "Starting phase 1/4 and 2/4: Forward Propagation into tmp files... "
                       << Timer::GetNow();
 
-            Timer p1;
             Timer all_phases;
-            std::vector<uint64_t> table_sizes =
-                WritePlotFile(memory, tmp_1_disks, k, id, memo, memo_len);
-            p1.PrintElapsed("Time for phase 1 =");
+            // Timer p1;
+            // Timer all_phases;
+            // std::vector<uint64_t> table_sizes =
+            //     WritePlotFile_Bitfield(memory, tmp_1_disks, k, id, memo, memo_len);
+            // p1.PrintElapsed("Time for phase 1 =");
 
-            std::cout << std::endl
-                      << "Starting phase 2/4: Backpropagation into tmp files... "
-                      << Timer::GetNow();
+            // std::cout << std::endl
+            //           << "Starting phase 2/4: Backpropagation into tmp files... "
+            //           << Timer::GetNow();
 
-            Timer p2;
+            // Timer p2;
+            // // std::vector<uint64_t> backprop_table_sizes =
+            // //     Backpropagate(memory, tmp_1_disks, table_sizes, k, id, memo, memo_len);
             // std::vector<uint64_t> backprop_table_sizes =
-            //     Backpropagate(memory, tmp_1_disks, table_sizes, k, id, memo, memo_len);
-            std::vector<uint64_t> backprop_table_sizes =
-                Backpropagate_Bitfield(memory, tmp_1_disks, table_sizes, k, id, memo, memo_len);
-            p2.PrintElapsed("Time for phase 2 =");
+            //     Backpropagate_Bitfield(memory, tmp_1_disks, table_sizes, k, id, memo, memo_len);
+            // p2.PrintElapsed("Time for phase 2 =");
+
+            std::vector<uint64_t> table_sizes =
+                AlgorithmFive(memory, tmp_1_disks, k, id, memo, memo_len);
 
             std::cout << std::endl
                       << "Starting phase 3/4: Compression from tmp files into " << tmp_2_filename
                       << " ... " << Timer::GetNow();
             Timer p3;
-            Phase3Results res = CompressTables(
-                memory, k, tmp2_disk, tmp_1_disks, backprop_table_sizes, id, memo, memo_len);
+            Phase3Results res =
+                CompressTables(memory, k, tmp2_disk, tmp_1_disks, table_sizes, id, memo, memo_len);
             p3.PrintElapsed("Time for phase 3 =");
 
             std::cout << std::endl
@@ -428,6 +432,762 @@ private:
         return bytes_written;
     }
 
+    std::vector<uint64_t> AlgorithmFive(
+        uint8_t* memory,
+        std::vector<FileDisk>& tmp_1_disks,
+        uint8_t k,
+        const uint8_t* id,
+        const uint8_t* memo,
+        uint8_t memo_len)
+    {
+        bool bitfield[2][1 << k];
+        memset(&bitfield, 0, 2 << k);
+        std::vector<uint64_t> table_sizes = std::vector<uint64_t>(8, 0);
+
+        {  // Phase 1
+            uint64_t plot_file = 0;
+            F1Calculator f1(k, id);
+            uint64_t x = 0;
+
+            Timer f1_start_time;
+
+            uint32_t entry_size_bytes = GetMaxEntrySize(k, 1, true);
+
+            // The max value our input (x), can take. A proof of space is 64 of these x values.
+            // uint64_t max_value = ((uint64_t)1 << (k)) - 1;
+            uint8_t buf[14];
+
+            // These are used for sorting on disk. The sort on disk code needs to know how
+            // many elements are in each bucket.
+            std::vector<uint64_t> bucket_sizes(kNumSortBuckets, 0);
+            std::vector<uint64_t> right_bucket_sizes(kNumSortBuckets, 0);
+
+            // Instead of computing f1(1), f1(2), etc, for each x, we compute them in batches
+            // to increase CPU efficency.
+
+            {  // Inline version of F1Calc.CalculateBuckets for performance
+                struct chacha8_ctx enc_ctx;
+                uint8_t enc_key[32];
+                enc_key[0] = 1;
+                memcpy(enc_key + 1, id, 31);
+                chacha8_keysetup(&enc_ctx, enc_key, 256, NULL);
+                uint64_t num_eval = 2 << (kBatchSizes - 1);
+                std::vector<Bits> blocks((num_eval + 1) * k / kF1BlockSizeBits + 2);
+                uint8_t ciphertext_bytes[kF1BlockSizeBits / 8];
+                int t = 0;
+
+                for (uint64_t lp = 0; lp < (((uint64_t)1) << (k - kBatchSizes)); lp++) {
+                    uint64_t count0 = (x * (uint128_t)k) / kF1BlockSizeBits;
+                    uint64_t count1 = (x + (uint128_t)num_eval + 1) * k / kF1BlockSizeBits;
+                    uint16_t start_bit = (x * (uint128_t)k) % kF1BlockSizeBits;
+                    uint64_t x2 = x + num_eval;
+                    t = 0;
+                    while (count0 <= count1) {
+                        chacha8_get_keystream(&enc_ctx, count0++, 1, ciphertext_bytes);
+                        Bits ciphertext(ciphertext_bytes, kF1BlockSizeBits / 8, kF1BlockSizeBits);
+                        blocks[t++] = std::move(ciphertext);
+                    }
+
+                    t = 0;
+                    for (; x < x2; x++) {
+                        Bits L_bits = Bits(x, k);
+                        // Takes the first kExtraBits bits from the input, and adds zeroes if it's
+                        // not enough
+                        Bits extra_data = L_bits.Slice(0, kExtraBits);
+                        if (extra_data.GetSize() < kExtraBits) {
+                            extra_data = extra_data + Bits(0, kExtraBits - extra_data.GetSize());
+                        }
+
+                        if (start_bit + k < kF1BlockSizeBits) {
+                            // Everything can be sliced from the current block
+                            (blocks[t].Slice(start_bit, start_bit + k) + extra_data + L_bits)
+                                .ToBytes(buf);
+                            tmp_1_disks[1].Write(plot_file, (buf), entry_size_bytes);
+                            plot_file += entry_size_bytes;
+                            bucket_sizes[SortOnDiskUtils::ExtractNum(
+                                buf, entry_size_bytes, 0, kLogNumSortBuckets)] += 1;
+                        } else {
+                            // Must move forward one block
+                            ((blocks[t].Slice(start_bit) +
+                              blocks[t + 1].Slice(0, k - kF1BlockSizeBits + start_bit)) +
+                             (extra_data + L_bits))
+                                .ToBytes(buf);
+                            tmp_1_disks[1].Write(plot_file, (buf), entry_size_bytes);
+                            plot_file += entry_size_bytes;
+                            bucket_sizes[SortOnDiskUtils::ExtractNum(
+                                buf, entry_size_bytes, 0, kLogNumSortBuckets)] += 1;
+                            t++;
+                        }
+
+                        // Start bit of the output slice in the current block
+                        start_bit += k;
+                        start_bit %= kF1BlockSizeBits;
+                    }
+                }
+            }
+
+            // A zero entry is the end of table symbol.
+            memset(buf, 0x00, entry_size_bytes);
+            tmp_1_disks[1].Write(plot_file, buf, entry_size_bytes);
+            table_sizes[1] = x + 1;
+            plot_file += entry_size_bytes;
+
+            f1_start_time.PrintElapsed("F1 complete, Time = ");
+
+            // Total number of entries in the current table (f1)
+            uint64_t total_table_entries = ((uint64_t)1) << k;
+
+            // Store positions to previous tables, in k bits.
+            uint8_t pos_size = k;
+            uint32_t right_entry_size_bytes = 0;
+            uint64_t max_spare_written = 0;
+
+            // Number of buckets that y values will be put into.
+            double num_buckets = ((uint64_t)1 << (k + kExtraBits)) / static_cast<double>(kBC) + 1;
+
+            // For tables 1 through 6, sort the table, calculate matches, and write
+            // the next table. This is the left table index.
+            for (uint8_t table_index = 1; table_index < 7; table_index++) {
+                Timer table_timer;
+                uint8_t metadata_size = kVectorLens[table_index + 1] * k;
+
+                // Determines how many bytes the entries in our left and right tables will take up.
+                uint32_t entry_size_bytes = GetMaxEntrySize(k, table_index, true);
+                uint32_t compressed_entry_size_bytes = GetMaxEntrySize(k, table_index, false);
+                right_entry_size_bytes = GetMaxEntrySize(k, table_index + 1, true);
+
+                std::cout << "Computing table " << int{table_index + 1} << std::endl;
+
+                total_table_entries = 0;
+
+                std::cout << "\tSorting table " << int{table_index} << std::endl;
+
+                // Performs a sort on the left table,
+                Timer sort_timer;
+                uint64_t spare_written = Sorting::SortOnDisk(
+                    tmp_1_disks[table_index],
+                    0,
+                    tmp_1_disks[0],
+                    entry_size_bytes,
+                    0,
+                    bucket_sizes,
+                    memory,
+                    memorySize);
+                if (spare_written > max_spare_written) {
+                    max_spare_written = spare_written;
+                }
+                sort_timer.PrintElapsed("\tSort time:");
+
+                Timer computation_pass_timer;
+
+                // Streams to read and right to tables. We will have handles to two tables. We will
+                // read through the left table, compute matches, and evaluate f for matching
+                // entries, writing results to the right table.
+                uint64_t left_reader = 0;
+                uint64_t left_writer = 0;
+                uint64_t right_writer = 0;
+                uint8_t* right_writer_buf = &(memory[0]);
+                uint8_t* left_writer_buf = &(memory[memorySize / 2]);
+                uint64_t left_buf_entries = memorySize / 2 / compressed_entry_size_bytes;
+                uint64_t right_buf_entries = memorySize / 2 / right_entry_size_bytes;
+                uint64_t left_writer_count = 0;
+                uint64_t right_writer_count = 0;
+
+                FxCalculator f(k, table_index + 1);
+
+                // This is a sliding window of entries, since things in bucket i can match with
+                // things in bucket i + 1. At the end of each bucket, we find matches between the
+                // two previous buckets.
+                std::vector<PlotEntry> bucket_L;
+                std::vector<PlotEntry> bucket_R;
+
+                uint64_t bucket = 0;
+                uint64_t pos = 0;           // Position into the left table
+                bool end_of_table = false;  // We finished all entries in the left table
+                uint64_t matches = 0;       // Total matches
+
+                // Buffers for storing a left or a right entry, used for disk IO
+                uint8_t* left_buf = new uint8_t[entry_size_bytes + 7];
+                uint8_t* right_buf;
+                uint8_t* tmp_buf;
+
+                Bits new_left_entry(0, pos_size + kOffsetSize);
+                std::vector<std::tuple<PlotEntry, PlotEntry, std::pair<Bits, Bits>>>
+                    current_entries_to_write;
+                std::vector<std::tuple<PlotEntry, PlotEntry, std::pair<Bits, Bits>>>
+                    future_entries_to_write;
+                std::vector<std::pair<uint16_t, uint16_t>> match_indexes;
+                std::vector<PlotEntry*>
+                    not_dropped;  // Pointers are stored to avoid copying entries
+
+                // Stores map of old positions to new positions (positions after dropping entries
+                // from L table that did not match) Map ke
+                uint16_t position_map_size = 2000;
+                uint16_t* L_position_map =
+                    new uint16_t[position_map_size];  // Should comfortably fit 2 buckets worth of
+                                                      // items
+                uint16_t* R_position_map = new uint16_t[position_map_size];
+                uint64_t L_position_base = 0;
+                uint64_t R_position_base = 0;
+                uint64_t newlpos, newrpos;
+
+                // Start at left table pos = 0 and iterate through the whole table. Note that the
+                // left table will already be sorted by y
+                while (!end_of_table) {
+                    PlotEntry left_entry;
+                    left_entry.right_metadata = 0;
+                    // Reads a left entry from disk
+                    tmp_1_disks[table_index].Read(left_reader, left_buf, entry_size_bytes);
+
+                    left_reader += entry_size_bytes;
+
+                    if (table_index == 1) {
+                        // For table 1, we only have y and metadata
+                        left_entry.y = Util::SliceInt64FromBytes(left_buf, 0, k + kExtraBits);
+                        left_entry.left_metadata =
+                            Util::SliceInt64FromBytes(left_buf, k + kExtraBits, metadata_size);
+                    } else {
+                        // For tables 2-6, we we also have pos and offset. We need to read this
+                        // because this entry will be written again to the table without the y (and
+                        // some entries are dropped).
+                        left_entry.y = Util::SliceInt64FromBytes(left_buf, 0, k + kExtraBits);
+                        left_entry.read_posoffset = Util::SliceInt64FromBytes(
+                            left_buf, k + kExtraBits, pos_size + kOffsetSize);
+                        if (metadata_size <= 128) {
+                            left_entry.left_metadata = Util::SliceInt128FromBytes(
+                                left_buf, k + kExtraBits + pos_size + kOffsetSize, metadata_size);
+                        } else {
+                            // Large metadatas that don't fit into 128 bits. (k > 32).
+                            left_entry.left_metadata = Util::SliceInt128FromBytes(
+                                left_buf, k + kExtraBits + pos_size + kOffsetSize, 128);
+                            left_entry.right_metadata = Util::SliceInt128FromBytes(
+                                left_buf,
+                                k + kExtraBits + pos_size + kOffsetSize + 128,
+                                metadata_size - 128);
+                        }
+                    }
+
+                    // This is not the pos that was read from disk,but the position of the entry we
+                    // read, within L table.
+                    left_entry.pos = pos;
+                    left_entry.used = false;
+
+                    end_of_table =
+                        (left_entry.y == 0 && left_entry.left_metadata == 0 &&
+                         left_entry.right_metadata == 0);
+                    uint64_t y_bucket = left_entry.y / kBC;
+
+                    // Keep reading left entries into bucket_L and R, until we run out of things
+                    if (y_bucket == bucket) {
+                        bucket_L.emplace_back(std::move(left_entry));
+                    } else if (y_bucket == bucket + 1) {
+                        bucket_R.emplace_back(std::move(left_entry));
+                    } else {
+                        // This is reached when we have finished adding stuff to bucket_R and
+                        // bucket_L, so now we can compare entries in both buckets to find matches.
+                        // If two entries match, the result is written to the right table. However
+                        // the writing happens in the next iteration of the loop, since we need to
+                        // remap positions.
+                        if (bucket_L.size() > 0) {
+                            not_dropped.clear();
+
+                            if (bucket_R.size() > 0) {
+                                // Compute all matches between the two buckets and save indeces.
+                                match_indexes = f.FindMatches(bucket_L, bucket_R);
+
+                                // We mark entries as used if they took part in a match.
+                                for (auto& indeces : match_indexes) {
+                                    bucket_L[std::get<0>(indeces)].used = true;
+                                    if (end_of_table) {
+                                        bucket_R[std::get<1>(indeces)].used = true;
+                                    }
+                                }
+                            }
+
+                            // Adds L_bucket entries that are used to not_dropped. They are used if
+                            // they either matched with something to the left (in the previous
+                            // iteration), or matched with something in bucket_R (in this
+                            // iteration).
+                            for (size_t bucket_index = 0; bucket_index < bucket_L.size();
+                                 bucket_index++) {
+                                PlotEntry& L_entry = bucket_L[bucket_index];
+                                if (L_entry.used) {
+                                    not_dropped.emplace_back(&bucket_L[bucket_index]);
+                                }
+                            }
+                            if (end_of_table) {
+                                // In the last two buckets, we will not get a chance to enter the
+                                // next iteration due to breaking from loop. Therefore to write the
+                                // final bucket in this iteration, we have to add the R entries to
+                                // the not_dropped list.
+                                for (size_t bucket_index = 0; bucket_index < bucket_R.size();
+                                     bucket_index++) {
+                                    PlotEntry& R_entry = bucket_R[bucket_index];
+                                    if (R_entry.used) {
+                                        not_dropped.emplace_back(&R_entry);
+                                    }
+                                }
+                            }
+                            // We keep maps from old positions to new positions. We only need two
+                            // maps, one for L bucket and one for R bucket, and we cycle through
+                            // them. Map keys are stored as positions % 2^10 for efficiency. Map
+                            // values are stored as offsets from the base position for that bucket,
+                            // for efficiency.
+                            uint16_t* tmp = L_position_map;
+                            L_position_map = R_position_map;
+                            R_position_map = tmp;
+                            L_position_base = R_position_base;
+                            R_position_base = left_writer_count;
+
+                            for (PlotEntry*& entry : not_dropped) {
+                                // Rewrite left entry with just pos and offset, to reduce working
+                                // space
+                                if (table_index == 1) {
+                                    // Table 1 goes from (f1, x) to just (x)
+                                    new_left_entry = Bits(entry->left_metadata, k);
+                                } else {
+                                    // Other tables goes from (f1, pos, offset, metadata) to just
+                                    // (pos, offset)
+                                    new_left_entry =
+                                        Bits(entry->read_posoffset, pos_size + kOffsetSize);
+                                }
+                                tmp_buf = left_writer_buf + (left_writer_count % left_buf_entries) *
+                                                                compressed_entry_size_bytes;
+                                // The new position for this entry = the total amount of thing
+                                // written to L so far. Since we only write entries in not_dropped,
+                                // about 14% of entries are dropped.
+                                R_position_map[entry->pos % position_map_size] =
+                                    left_writer_count - R_position_base;
+                                left_writer_count++;
+                                new_left_entry.ToBytes(tmp_buf);
+                                if (left_writer_count % left_buf_entries == 0) {
+                                    tmp_1_disks[table_index].Write(
+                                        left_writer,
+                                        left_writer_buf,
+                                        left_buf_entries * compressed_entry_size_bytes);
+                                    left_writer += left_buf_entries * compressed_entry_size_bytes;
+                                }
+                            }
+
+                            // Two vectors to keep track of things from previous iteration and from
+                            // this iteration.
+                            current_entries_to_write.swap(future_entries_to_write);
+                            future_entries_to_write.clear();
+
+                            for (auto& indeces : match_indexes) {
+                                PlotEntry& L_entry = bucket_L[std::get<0>(indeces)];
+                                PlotEntry& R_entry = bucket_R[std::get<1>(indeces)];
+
+                                ++matches;
+                                ++total_table_entries;
+
+                                // Sets the R entry to used so that we don't drop in next iteration
+                                R_entry.used = true;
+                                // Computes the output pair (fx, new_metadata)
+                                if (metadata_size <= 128) {
+                                    const std::pair<Bits, Bits>& f_output = f.CalculateBucket(
+                                        Bits(L_entry.y, k + kExtraBits),
+                                        Bits(R_entry.y, k + kExtraBits),
+                                        Bits(L_entry.left_metadata, metadata_size),
+                                        Bits(R_entry.left_metadata, metadata_size));
+                                    future_entries_to_write.push_back(
+                                        std::make_tuple(L_entry, R_entry, f_output));
+                                } else {
+                                    // Metadata does not fit into 128 bits
+                                    const std::pair<Bits, Bits>& f_output = f.CalculateBucket(
+                                        Bits(L_entry.y, k + kExtraBits),
+                                        Bits(R_entry.y, k + kExtraBits),
+                                        Bits(L_entry.left_metadata, 128) +
+                                            Bits(L_entry.right_metadata, metadata_size - 128),
+                                        Bits(R_entry.left_metadata, 128) +
+                                            Bits(R_entry.right_metadata, metadata_size - 128));
+                                    future_entries_to_write.push_back(
+                                        std::make_tuple(L_entry, R_entry, f_output));
+                                }
+                            }
+                            // At this point, future_entries_to_write contains the matches of
+                            // buckets L and R, and current_entries_to_write contains the matches of
+                            // L and the bucket left of L. These are the ones that we will write.
+                            uint16_t final_current_entry_size = current_entries_to_write.size();
+                            if (end_of_table) {
+                                // For the final bucket, write the future entries now as well, since
+                                // we will break from loop
+                                current_entries_to_write.insert(
+                                    current_entries_to_write.end(),
+                                    future_entries_to_write.begin(),
+                                    future_entries_to_write.end());
+                            }
+                            for (size_t i = 0; i < current_entries_to_write.size(); i++) {
+                                const auto& entry_tuple = current_entries_to_write[i];
+                                const PlotEntry& L_entry = std::get<0>(entry_tuple);
+                                const PlotEntry& R_entry = std::get<1>(entry_tuple);
+
+                                const std::pair<Bits, Bits>& f_output = std::get<2>(entry_tuple);
+                                // We only need k instead of k + kExtraBits bits for the last table
+                                Bits new_entry = table_index + 1 == 7
+                                                     ? std::get<0>(f_output).Slice(0, k)
+                                                     : std::get<0>(f_output);
+
+                                // Maps the new positions. If we hit end of pos, we must write
+                                // things in both final_entries to write and
+                                // current_entries_to_write, which are in both position maps.
+                                if (!end_of_table || i < final_current_entry_size) {
+                                    newlpos = L_position_map[L_entry.pos % position_map_size] +
+                                              L_position_base;
+                                } else {
+                                    newlpos = R_position_map[L_entry.pos % position_map_size] +
+                                              R_position_base;
+                                }
+                                newrpos = R_position_map[R_entry.pos % position_map_size] +
+                                          R_position_base;
+                                // Position in the previous table
+                                new_entry.AppendValue(newlpos, pos_size);
+
+                                // Offset for matching entry
+                                if (newrpos - newlpos > (1U << kOffsetSize) * 97 / 100) {
+                                    std::cout << "Offset: " << newrpos - newlpos << std::endl;
+                                    abort();
+                                }
+                                new_entry.AppendValue(newrpos - newlpos, kOffsetSize);
+                                // New metadata which will be used to compute the next f
+                                new_entry += std::get<1>(f_output);
+
+                                right_buf =
+                                    right_writer_buf + (right_writer_count % right_buf_entries) *
+                                                           right_entry_size_bytes;
+                                right_writer_count++;
+
+                                // Writes the new entry into the right table
+                                new_entry.ToBytes(right_buf);
+                                if (right_writer_count % right_buf_entries == 0) {
+                                    tmp_1_disks[table_index + 1].Write(
+                                        right_writer,
+                                        right_writer_buf,
+                                        right_buf_entries * right_entry_size_bytes);
+                                    right_writer += right_buf_entries * right_entry_size_bytes;
+                                }
+
+                                // Computes sort bucket, so we can sort the table by y later, more
+                                // easily
+                                right_bucket_sizes[SortOnDiskUtils::ExtractNum(
+                                    right_buf, right_entry_size_bytes, 0, kLogNumSortBuckets)] += 1;
+                            }
+
+                            /*
+                            if (table_index == 6) {
+                                for (size_t i = 0; i < current_entries_to_write.size(); i++) {
+                                    const auto& entry_tuple = current_entries_to_write[i];
+                                    const PlotEntry& L_entry = std::get<0>(entry_tuple);
+                                    const PlotEntry& R_entry = std::get<1>(entry_tuple);
+                                    std::cout << "Debug[L] " << L_entry.pos
+                                              << std::endl;  // " " << L_entry.offset
+                                    // << std::endl;
+                                    std::cout << "Debug[R] " << R_entry.pos
+                                              << std::endl;  //" " << R_entry.offset
+                                    // << std::endl;
+
+                                    bitfield[0][L_entry.pos] = 1;
+                                    // bitfield[1][L_entry.pos + L_entry.offset] = 1;
+                                    bitfield[0][R_entry.pos] = 1;
+                                    // bitfield[1][R_entry.pos + R_entry.offset] = 1;
+                                }
+                            }
+                            */
+                        }
+                        if (y_bucket == bucket + 2) {
+                            // We saw a bucket that is 2 more than the current, so we just set L =
+                            // R, and R = [entry]
+                            bucket_L = bucket_R;
+                            bucket_R = std::vector<PlotEntry>();
+                            bucket_R.emplace_back(std::move(left_entry));
+                            ++bucket;
+                        } else {
+                            // We saw a bucket that >2 more than the current, so we just set L =
+                            // [entry], and R = []
+                            bucket = y_bucket;
+                            bucket_L = std::vector<PlotEntry>();
+                            bucket_L.emplace_back(std::move(left_entry));
+                            bucket_R = std::vector<PlotEntry>();
+                        }
+                    }
+                    // Increase the read pointer in the left table, by one
+                    ++pos;
+                }
+
+                // Total matches found in the left table
+                std::cout << "\tTotal matches: " << matches
+                          << ". Per bucket: " << (matches / num_buckets) << std::endl;
+
+                table_sizes[table_index] = left_writer_count + 1;
+                if (table_index == 6) {
+                    table_sizes[7] = right_writer_count + 1;
+                }
+                // Finishes writing L table, and writes the 0 entry (EOT) for left table
+                // Also truncates the file after the final write position, deleting no longer useful
+                // working space
+                tmp_1_disks[table_index].Write(
+                    left_writer,
+                    left_writer_buf,
+                    (left_writer_count % left_buf_entries) * compressed_entry_size_bytes);
+                left_writer += (left_writer_count % left_buf_entries) * compressed_entry_size_bytes;
+
+                memset(left_buf, 0x00, compressed_entry_size_bytes);
+                tmp_1_disks[table_index].Write(left_writer, left_buf, compressed_entry_size_bytes);
+                left_writer += compressed_entry_size_bytes;
+                tmp_1_disks[table_index].Truncate(left_writer);
+
+                tmp_1_disks[table_index + 1].Write(
+                    right_writer,
+                    right_writer_buf,
+                    (right_writer_count % right_buf_entries) * right_entry_size_bytes);
+                right_writer += (right_writer_count % right_buf_entries) * right_entry_size_bytes;
+
+                // Writes the 0 entry (EOT) for right table
+                memset(right_writer_buf, 0x00, right_entry_size_bytes);
+                tmp_1_disks[table_index + 1].Write(
+                    right_writer, right_writer_buf, right_entry_size_bytes);
+
+                // Resets variables
+                bucket_sizes = right_bucket_sizes;
+                right_bucket_sizes = std::vector<uint64_t>(kNumSortBuckets, 0);
+
+                computation_pass_timer.PrintElapsed("\tComputation pass time:");
+                table_timer.PrintElapsed("Forward propagation table time:");
+
+                delete[] left_buf;
+                delete[] L_position_map;
+                delete[] R_position_map;
+            }
+            table_sizes[0] = max_spare_written;
+        }  // End Phase 1
+
+        {
+            std::vector<uint64_t> bucket_sizes_pos(kNumSortBuckets, 0);
+            std::vector<uint64_t> new_table_sizes = std::vector<uint64_t>(8, 0);
+            new_table_sizes[7] = table_sizes[7];
+            for (int i = 0; i < 8; ++i)
+                std::cout << "Debug [tsize] " << i << " " << table_sizes[i] << std::endl;
+            uint64_t entry_size_bytes;
+            uint64_t numEntries;
+
+            int debugt = 0;
+            for (int i = 0; i < (1 << k); ++i) {
+                if (bitfield[0][i]) {
+                    debugt++;
+                    std::cout << "Debug[bitfield] " << debugt << " " << i << std::endl;
+                }
+            }
+
+            for (int i = 0; i < (1 << k); ++i) bitfield[0][i] = true;  // TODO: debug
+
+            for (uint8_t table_index = 6; table_index >= 1; table_index--) {
+                bool CUR = table_index & 1;  // positions in bitfield[][]
+                bool NXT = CUR ^ 1;
+                std::cout << "Debug [tableindex] " << table_index << " " << CUR << " " << NXT
+                          << std::endl;
+
+                int debug_bfct = 0;
+                for (uint64_t i = 0; i < ((uint64_t)1 << k); ++i) {
+                    if (bitfield[CUR][i])
+                        debug_bfct++;
+                    bitfield[NXT][i] = 0;
+                }
+                std::cout << "Debug [bfct] " << debug_bfct << std::endl;
+
+                // From the current bitfield[CUR], we are highlighting bitfield[NXT]
+
+                entry_size_bytes = GetMaxEntrySize(k, table_index, false);
+
+                // Try to read from tmp_1_disks[table_index]
+                FileDisk& disk = tmp_1_disks[table_index];
+                uint64_t read_disk_ptr = 0;
+                uint64_t write_disk_ptr = 0;
+
+                uint8_t* read_buf = &(memory[0]);
+                uint8_t* write_buf = &(memory[memorySize / 2]);
+                uint8_t* read_buf_cursor = read_buf;
+                uint8_t* write_buf_cursor = write_buf;
+
+                uint64_t write_wheel = 0;  // num written entries in buffer, mod num_buf_entries
+                uint64_t num_buf_entries = memorySize / 2 / entry_size_bytes;
+                uint64_t remaining_entries = table_sizes[table_index];
+                uint64_t entry_sort_key = 0;
+                uint64_t entry_pos = 0;
+                uint64_t entry_offset = 0;
+                uint64_t entry_counter = 0;
+                uint64_t t = 0;  // index in table
+
+                auto read_from_disk = [&]() {
+                    // Side effects: read_disk_ptr
+                    // Return: number of entries read
+                    uint64_t n_entries = std::min(num_buf_entries, remaining_entries);
+                    uint64_t readAmt = n_entries * entry_size_bytes;
+                    disk.Read(read_disk_ptr, read_buf, readAmt);
+                    read_disk_ptr += readAmt;
+                    return n_entries;
+                };
+
+                auto write_to_disk = [&](Bits entry) {
+                    // Side effects: write_buf_cursor, write_disk_ptr, write_wheel
+                    entry.ToBytes(write_buf_cursor);
+                    write_buf_cursor += entry_size_bytes;
+                    if (++write_wheel == num_buf_entries) {  // buffer full, write to disk
+                        write_wheel = 0;
+                        write_buf_cursor = write_buf;
+                        uint64_t writeAmt = num_buf_entries * entry_size_bytes;
+                        disk.Write(write_disk_ptr, write_buf, writeAmt);
+                        write_disk_ptr += writeAmt;
+                    }
+                };
+
+                // std::cout << "Debug[entries] " << remaining_entries << std::endl;
+                while (remaining_entries) {
+                    numEntries = read_from_disk();
+                    remaining_entries -= numEntries;
+
+                    // std::cout << "Debug[entries2] " << remaining_entries << " " << numEntries
+                    //           << std::endl;
+
+                    // Process each entry in read_buf
+                    read_buf_cursor = read_buf;
+                    for (uint64_t i = 0; i < numEntries; i++) {
+                        if (table_index >= 2) {
+                            if (table_index == 7) {
+                                entry_pos =
+                                    Util::SliceInt64FromBytes(read_buf_cursor, k + kExtraBits, k);
+                                entry_offset = Util::SliceInt64FromBytes(
+                                    read_buf_cursor, 2 * k + kExtraBits, kOffsetSize);
+                            } else {
+                                entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
+                                entry_offset =
+                                    Util::SliceInt64FromBytes(read_buf_cursor, k, kOffsetSize);
+
+                                std::cout << "Debug [ii] " << i << " " << Bits(entry_pos, k) << " "
+                                          << Bits(entry_offset, kOffsetSize) << " "
+                                          << "BF " << bitfield[CUR][entry_pos] << " " << entry_pos
+                                          << " " << CUR << std::endl;
+                            }
+
+                            std::cout << "Debug[pong] " << bitfield[CUR][entry_pos] << std::endl;
+
+                            if (bitfield[CUR][t++]) {
+                                bitfield[NXT][entry_pos] = bitfield[NXT][entry_pos + entry_offset] =
+                                    1;
+                                Bits debug_entry = Bits(entry_counter, k) + Bits(entry_pos, k) +
+                                                   Bits(entry_offset, kOffsetSize);
+                                std::cout << "Debug[leftentry] " << bitfield[CUR][entry_pos] << " "
+                                          << debug_entry << std::endl;
+                                if (table_index < 7) {
+                                    write_to_disk(
+                                        Bits(entry_counter, k) + Bits(entry_pos, k) +
+                                        Bits(entry_offset, kOffsetSize));
+                                }
+                                entry_counter++;
+                            }
+                        } else {
+                            entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
+                            if (bitfield[CUR][t++]) {
+                                // std::cout << "Debug[leftentry.] " << Bits(entry_counter, k + 1)
+                                //           << std::endl;
+                                // This moves the entry from read ptr to write ptr
+                                write_to_disk(Bits(entry_pos, k));
+                                entry_counter++;
+                            }
+                        }
+
+                        read_buf_cursor += entry_size_bytes;
+                    }
+                }
+
+                if (write_wheel) {  // flush write buffer
+                    disk.Write(write_disk_ptr, write_buf, write_wheel * entry_size_bytes);
+                    write_disk_ptr += write_wheel * entry_size_bytes;
+                    write_wheel = 0;
+                    write_buf_cursor = write_buf;
+                }
+
+                std::cout << "Debug [Entry counter] " << entry_counter << std::endl;
+
+                if (table_index >= 2 && table_index <= 6) {
+                    std::cout << "Debug [ti] " << (int)table_index << std::endl;
+                    // Generate position_map checkpoints from bitfield
+                    std::unordered_map<uint64_t, uint64_t> bitmap;
+                    uint64_t t = 0;
+                    for (uint64_t i = 0; i < ((uint64_t)1 << k); ++i) {
+                        if (bitfield[CUR][i]) {
+                            // std::cout << "Debug [bitmap] " << i << " " << t << std::endl;
+                            bitmap[i] = t++;
+                        }
+                    }
+
+                    assert(t == entry_counter);
+
+                    // For each entry in disk[t], rewrite entry
+                    remaining_entries = entry_counter;
+                    read_disk_ptr = 0;
+                    write_disk_ptr = 0;
+                    read_buf_cursor = read_buf;
+                    write_buf_cursor = write_buf;
+                    uint64_t new_pos, new_offset;
+
+                    std::vector<uint64_t> bucket_sizes_pos(kNumSortBuckets, 0);
+
+                    while (remaining_entries) {
+                        numEntries = read_from_disk();
+                        remaining_entries -= numEntries;
+
+                        for (uint64_t i = 0; i < numEntries; i++) {
+                            entry_sort_key = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
+                            entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, k, k);
+                            entry_offset =
+                                Util::SliceInt64FromBytes(read_buf_cursor, 2 * k, kOffsetSize);
+                            new_pos = bitmap[entry_pos];
+                            new_offset = bitmap[entry_pos + entry_offset] - new_pos;
+
+                            if (new_offset) {
+                                write_to_disk(
+                                    Bits(entry_sort_key, k) + Bits(new_pos, k) +
+                                    Bits(new_offset, kOffsetSize));
+                            } else {
+                                write_to_disk(Bits(0, 2 * k + kOffsetSize));
+                            }
+                            Bits debug_entry = Bits(entry_sort_key, k) + Bits(new_pos, k) +
+                                               Bits(new_offset, kOffsetSize);
+                            std::cout << "Debug[precursor] " << Bits(entry_pos, k) << " "
+                                      << Bits(entry_offset, kOffsetSize) << std::endl;
+                            std::cout << "Debug [news] " << new_pos << " " << new_offset
+                                      << std::endl;
+                            std::cout << "Debug[entry] " << debug_entry << std::endl;
+
+                            read_buf_cursor += entry_size_bytes;
+
+                            bucket_sizes_pos[entry_sort_key >> (k - kLogNumSortBuckets)]++;
+                        }
+                    }
+
+                    // To make bitfield backprop compatible with the old algorithm,
+                    // we need to sort the tables as in the old algorithm.  However,
+                    // this step should be removed once phase 3 etc. handles the sort.
+                    /*
+                    Sorting::SortOnDisk(
+                        tmp_1_disks[table_index],
+                        0,
+                        tmp_1_disks[0],
+                        entry_size_bytes,
+                        0,
+                        bucket_sizes_pos,
+                        memory,
+                        memorySize);
+                    */
+                }
+
+                new_table_sizes[table_index] = entry_counter;
+                std::cout << "Debug [size] " << table_index << " " << entry_counter << std::endl;
+            }
+
+            return new_table_sizes;
+        }
+    }
     // This is Phase 1, or forward propagation. During this phase, all of the 7 tables,
     // and f functions, are evaluated. The result is an intermediate plot file, that is
     // several times larger than what the final file will be, but that has all of the
@@ -932,173 +1692,6 @@ private:
         }
         table_sizes[0] = max_spare_written;
         return table_sizes;
-    }
-
-    std::vector<uint64_t> Backpropagate_Bitfield(
-        uint8_t* memory,
-        std::vector<FileDisk>& tmp_1_disks,
-        std::vector<uint64_t> table_sizes,
-        uint8_t k,
-        const uint8_t* id,
-        const uint8_t* memo,
-        uint32_t memo_len)
-    {
-        bool bitfield[2][1 << k];
-        memset(&bitfield[0], 1, 1 << k);  // all entries of table 7 are live
-
-        std::vector<uint64_t> bucket_sizes_pos(kNumSortBuckets, 0);
-        std::vector<uint64_t> new_table_sizes = std::vector<uint64_t>(8, 0);
-        new_table_sizes[7] = table_sizes[7];
-        for (int i = 0; i < 8; ++i)
-            std::cout << "Debug [tsize] " << i << " " << table_sizes[i] << std::endl;
-        uint64_t entry_size_bytes;
-        uint64_t numEntries;
-
-        for (uint8_t table_index = 6; table_index >= 1; table_index--) {
-            bool CUR = table_index & 1;  // positions in bitfield[][]
-            bool NXT = CUR ^ 1;
-            memset(&bitfield[NXT], 0, 1 << k);
-            // From the current bitfield[CUR], we are highlighting bitfield[NXT]
-
-            entry_size_bytes = GetMaxEntrySize(k, table_index, false);
-
-            // Try to read from tmp_1_disks[table_index + 1]
-            FileDisk& disk = tmp_1_disks[table_index];
-            uint64_t read_disk_ptr = 0;
-            uint64_t write_disk_ptr = 0;
-
-            uint8_t* read_buf = &(memory[0]);
-            uint8_t* write_buf = &(memory[memorySize / 2]);
-            uint8_t* read_buf_cursor = read_buf;
-            uint8_t* write_buf_cursor = write_buf;
-
-            uint64_t write_wheel = 0;  // number of written entries in buffer, mod num_buf_entries
-            uint64_t num_buf_entries = memorySize / 2 / entry_size_bytes;
-            uint64_t remaining_entries = table_sizes[table_index];
-            uint64_t entry_sort_key = 0;
-            uint64_t entry_pos = 0;
-            uint64_t entry_offset = 0;
-            uint64_t entry_counter = 0;
-
-            auto read_from_disk = [&]() {
-                // Side effects: read_disk_ptr
-                // Return: number of entries read
-                uint64_t n_entries = std::min(num_buf_entries, remaining_entries);
-                uint64_t readAmt = n_entries * entry_size_bytes;
-                disk.Read(read_disk_ptr, read_buf, readAmt);
-                read_disk_ptr += readAmt;
-                return n_entries;
-            };
-
-            auto write_to_disk = [&](Bits entry) {
-                // Side effects: write_buf_cursor, write_disk_ptr, write_wheel
-                entry.ToBytes(write_buf_cursor);
-                write_buf_cursor += entry_size_bytes;
-                if (++write_wheel == num_buf_entries) {  // buffer full, write to disk
-                    write_wheel = 0;
-                    write_buf_cursor = write_buf;
-                    uint64_t writeAmt = num_buf_entries * entry_size_bytes;
-                    disk.Write(write_disk_ptr, write_buf, writeAmt);
-                    write_disk_ptr += writeAmt;
-                }
-            };
-
-            std::cout << "Debug[entries] " << remaining_entries << std::endl;
-            while (remaining_entries) {
-                numEntries = read_from_disk();
-                remaining_entries -= numEntries;
-
-                std::cout << "Debug[entries2] " << remaining_entries << " " << numEntries
-                          << std::endl;
-
-                // Process each entry in read_buf
-                read_buf_cursor = read_buf;
-                for (uint64_t i = 0; i < numEntries; i++) {
-                    if (table_index >= 2) {
-                        entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
-                        entry_offset = Util::SliceInt64FromBytes(read_buf_cursor, k, kOffsetSize);
-
-                        if (bitfield[CUR][entry_pos]) {
-                            bitfield[NXT][entry_pos] = bitfield[NXT][entry_pos + entry_offset] = 1;
-                            Bits debug_entry = Bits(entry_counter, k) + Bits(entry_pos, k) +
-                                               Bits(entry_offset, kOffsetSize);
-                            std::cout << "Debug[leftentry] " << debug_entry << std::endl;
-                            write_to_disk(
-                                Bits(entry_counter, k) + Bits(entry_pos, k) +
-                                Bits(entry_offset, kOffsetSize));
-                            entry_counter++;
-                        }
-                    } else {
-                        entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
-                        if (bitfield[CUR][entry_pos]) {
-                            // std::cout << "Debug[leftentry.] " << Bits(entry_counter, k + 1)
-                            //           << std::endl;
-                            write_to_disk(Bits(entry_counter, k));
-                            entry_counter++;
-                        }
-                    }
-
-                    read_buf_cursor += entry_size_bytes;
-                }
-            }
-
-            if (write_wheel) {  // flush write buffer
-                disk.Write(write_disk_ptr, write_buf, write_wheel * entry_size_bytes);
-                write_disk_ptr += write_wheel * entry_size_bytes;
-                write_wheel = 0;
-                write_buf_cursor = write_buf;
-            }
-
-            std::cout << "Debug [Entry counter] " << entry_counter << std::endl;
-
-            if (table_index >= 2) {
-                // Generate position_map checkpoints from bitfield
-                std::unordered_map<uint64_t, uint64_t> bitmap;
-                uint64_t t = 0;
-                for (uint64_t i = 0; i < table_sizes[table_index]; ++i) {
-                    if (bitfield[CUR][i]) {
-                        bitmap[t++] = i;
-                    }
-                }
-
-                assert(t == entry_counter);
-
-                // For each entry in disk[t], rewrite entry
-                remaining_entries = entry_counter;
-                read_disk_ptr = 0;
-                write_disk_ptr = 0;
-                read_buf_cursor = read_buf;
-                write_buf_cursor = write_buf;
-                uint64_t new_pos, new_offset;
-
-                while (remaining_entries) {
-                    numEntries = read_from_disk();
-                    remaining_entries -= numEntries;
-
-                    for (uint64_t i = 0; i < numEntries; i++) {
-                        entry_sort_key = Util::SliceInt64FromBytes(read_buf_cursor, 0, k);
-                        entry_pos = Util::SliceInt64FromBytes(read_buf_cursor, k, k);
-                        entry_offset =
-                            Util::SliceInt64FromBytes(read_buf_cursor, 2 * k, kOffsetSize);
-                        new_pos = bitmap[entry_pos];
-                        new_offset = bitmap[entry_offset];
-                        write_to_disk(
-                            Bits(entry_sort_key, k) + Bits(new_pos, k) +
-                            Bits(new_offset, kOffsetSize));
-
-                        Bits debug_entry = Bits(entry_sort_key, k) + Bits(new_pos, k) +
-                                           Bits(new_offset, kOffsetSize);
-                        std::cout << "Debug[entry] " << debug_entry << std::endl;
-
-                        read_buf_cursor += entry_size_bytes;
-                    }
-                }
-            }
-
-            new_table_sizes[table_index] = entry_counter;
-        }
-
-        return new_table_sizes;
     }
 
     // Backpropagate takes in as input, a file on which forward propagation has been done.
