@@ -237,7 +237,7 @@ namespace Util {
         }
 
         uint64_t tmp = 0;
-        memcpy(&tmp, bytes, std::min(uint32_t(sizeof(uint64_t)), cdiv(start_bit + num_bits, 8)));
+        memcpy(&tmp, bytes, std::min<size_t>(sizeof(tmp), ((start_bit + num_bits + 7) >> 3)) );
         tmp = bswap_64(tmp);
         tmp <<= start_bit;
         tmp >>= 64 - num_bits;
