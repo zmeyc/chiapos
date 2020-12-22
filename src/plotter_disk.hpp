@@ -367,8 +367,12 @@ public:
                 }
             } else {
                 if (!bCopied) {
+                    int dir_fd = Util::lock_directory(final_dirname);
                     fs::copy(
                         tmp_2_filename, final_2_filename, fs::copy_options::overwrite_existing, ec);
+                    if (dir_fd != -1) {
+                        Util::unlock_directory(dir_fd, final_dirname);
+                    }
                     if (ec.value() != 0) {
                         std::cout << "Could not copy " << tmp_2_filename << " to "
                                   << final_2_filename << ". Error " << ec.message()
@@ -398,11 +402,7 @@ public:
             }
 
             if (!bRenamed) {
-#ifdef _WIN32
-                Sleep(5 * 60000);
-#else
-                sleep(5 * 60);
-#endif
+                Util::sleep_seconds(5 * 60);
             }
         } while (!bRenamed);
     }
