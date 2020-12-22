@@ -18,6 +18,7 @@
 #ifndef _WIN32
 #include <semaphore.h>
 #include <sys/resource.h>
+#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -367,8 +368,12 @@ public:
                 }
             } else {
                 if (!bCopied) {
+                    int dir_fd = lock_directory(final_dirname);
                     fs::copy(
                         tmp_2_filename, final_2_filename, fs::copy_options::overwrite_existing, ec);
+                    if (dir_fd != -1) {
+                        unlock_directory(dir_fd, final_dirname);
+                    }
                     if (ec.value() != 0) {
                         std::cout << "Could not copy " << tmp_2_filename << " to "
                                   << final_2_filename << ". Error " << ec.message()
@@ -398,13 +403,52 @@ public:
             }
 
             if (!bRenamed) {
-#ifdef _WIN32
-                Sleep(5 * 60000);
-#else
-                sleep(5 * 60);
-#endif
+                sleep_seconds(5 * 60);
             }
         } while (!bRenamed);
+    }
+
+    int lock_directory(
+        std::string dirname)
+    {
+        int dir_fd = open(dirname.c_str(), O_RDONLY | O_NOCTTY);
+        if (dir_fd == -1) {
+            std::cerr << "Unable to open directory for locking: " << dirname
+                << ". Error: " << strerror(errno) << std::endl;
+            return -1;
+        }
+        while (0 != flock(dir_fd, LOCK_EX | LOCK_NB)) {
+            if (EWOULDBLOCK == errno) {
+                std::cout << "Directory locked, waiting (retrying in 1 minute): " << dirname << std::endl;
+            } else {
+                std::cerr << "Unable to lock directory (retrying in 1 minute): "
+                    << ". Error: " << strerror(errno) << std::endl;
+            }
+            sleep_seconds(1 * 60);
+        }
+        return dir_fd;
+    }
+
+    void unlock_directory(
+        int dir_fd,
+        std::string dirname)
+    {
+        if (-1 == flock(dir_fd, LOCK_UN)) {
+            std::cerr << "Failed to unlock the directory: " << dirname
+                << ". Error: " << strerror(errno) << std::endl;
+        }
+        if (-1 == close(dir_fd)) {
+            std::cerr << "Failed to close the directory during unlocking: " << dirname
+                << ". Error: " << strerror(errno) << std::endl;
+        }
+	}
+
+    void sleep_seconds(int seconds) {
+#ifdef _WIN32
+                Sleep(seconds * 1000);
+#else
+                sleep(seconds);
+#endif
     }
 
 private:
