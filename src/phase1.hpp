@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <mutex>
 
 // Gulrak filesystem brings in Windows headers that cause some issues with std
 #define _HAS_STD_BYTE 0
@@ -80,6 +81,7 @@ struct GlobalData {
     uint64_t right_writer;
     uint64_t stripe_size;
     uint8_t num_threads;
+    std::mutex disk_mutex;
 };
 
 GlobalData globals;
@@ -519,6 +521,7 @@ void* phase1_thread(THREADDATA* ptd)
             }
         } else {
             // Writes out the right table for table 7
+            std::unique_lock<std::mutex> lock(globals.disk_mutex);
             (*ptmp_1_disks)[table_index + 1].Write(
                 globals.right_writer,
                 right_writer_buf,
@@ -527,8 +530,11 @@ void* phase1_thread(THREADDATA* ptd)
         globals.right_writer += right_writer_count * right_entry_size_bytes;
         globals.right_writer_count += right_writer_count;
 
-        (*ptmp_1_disks)[table_index].Write(
-            globals.left_writer, left_writer_buf, left_writer_count * compressed_entry_size_bytes);
+        {
+            std::unique_lock<std::mutex> lock(globals.disk_mutex);
+            (*ptmp_1_disks)[table_index].Write(
+                globals.left_writer, left_writer_buf, left_writer_count * compressed_entry_size_bytes);
+        }
         globals.left_writer += left_writer_count * compressed_entry_size_bytes;
         globals.left_writer_count += left_writer_count;
 
