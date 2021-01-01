@@ -20,6 +20,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <mutex>
 
 #define BUF_SIZE 262144
 
@@ -38,7 +39,8 @@ public:
         uint8_t *memory,
         uint32_t entry_len,
         uint64_t num_entries,
-        uint32_t bits_begin)
+        uint32_t bits_begin,
+        std::mutex *disk_mutex)
     {
         uint32_t entry_len_memory = entry_len - bits_begin / 8;
         uint64_t memory_len = Util::RoundSize(num_entries) * entry_len_memory;
@@ -60,7 +62,11 @@ public:
                 // If read buffer is empty, read from disk and refill it.
                 buf_size = std::min((uint64_t)BUF_SIZE / entry_len, num_entries - i);
                 buf_ptr = 0;
+                if (disk_mutex)
+                    disk_mutex->lock();
                 input_disk.Read(read_pos, buffer, buf_size * entry_len);
+                if (disk_mutex)
+                    disk_mutex->unlock();
                 read_pos += buf_size * entry_len;
                 if (!set_prefix) {
                     // We don't store the common prefix of all entries in memory, instead just
@@ -123,6 +129,6 @@ private:
                 return false;
         return true;
     }
-};
+ };
 
 #endif  // SRC_CPP_UNIFORMSORT_HPP_

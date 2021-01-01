@@ -47,7 +47,8 @@ public:
         const std::string &tmp_dirname,
         const std::string &filename,
         uint32_t begin_bits,
-        uint64_t stripe_size)
+        uint64_t stripe_size,
+        std::mutex *disk_mutex)
     {
         this->memory_start = memory;
         this->memory_size = memory_size;
@@ -80,6 +81,7 @@ public:
         this->final_position_end = 0;
         this->next_bucket_to_sort = 0;
         this->entry_buf = new uint8_t[entry_size + 7]();
+        this->disk_mutex = disk_mutex;
     }
 
     inline void AddToCache(const Bits &entry)
@@ -221,6 +223,8 @@ private:
     uint64_t next_bucket_to_sort;
     uint8_t *entry_buf;
 
+    std::mutex *disk_mutex;
+
     inline void FlushTable(uint16_t bucket_i)
     {
         uint64_t start_write = this->bucket_write_pointers[bucket_i];
@@ -274,7 +278,8 @@ private:
                 memory_start,
                 this->entry_size,
                 bucket_entries,
-                this->begin_bits + this->log_num_buckets);
+                this->begin_bits + this->log_num_buckets,
+                disk_mutex);
         } else {
             // Are we in Compress phrase 1 (quicksort=1) or is it the last bucket (quicksort=2)?
             // Perform quicksort if so (SortInMemory algorithm won't always perform well), or if we
@@ -283,8 +288,12 @@ private:
                       << std::setprecision(3) << have_ram << "GiB, u_sort min: " << u_ram
                       << "GiB, qs min: " << qs_ram << "GiB. force_qs: " << force_quicksort
                       << std::endl;
+            if (disk_mutex)
+                disk_mutex->lock();
             this->bucket_files[bucket_i].Read(
                 0, this->memory_start, bucket_entries * this->entry_size);
+            if (disk_mutex)
+                disk_mutex->unlock();
             QuickSort::Sort(this->memory_start, this->entry_size, bucket_entries, this->begin_bits);
         }
 

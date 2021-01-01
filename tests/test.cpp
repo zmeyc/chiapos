@@ -747,7 +747,7 @@ TEST_CASE("Sort on disk")
         uint32_t begin = 0;
         const uint32_t memory_len = 1000000;
         uint8_t* memory = new uint8_t[memory_len];
-        SortManager manager(memory, memory_len, 16, 4, size, ".", "test-files", 0, 1);
+        SortManager manager(memory, memory_len, 16, 4, size, ".", "test-files", 0, 1, nullptr);
         int total_written_1 = 0;
         for (uint32_t i = 0; i < iters; i++) {
             vector<unsigned char> hash_input = intToBytes(i, 4);
@@ -778,7 +778,7 @@ TEST_CASE("Sort on disk")
         uint32_t begin = 0;
         const uint32_t memory_len = 1000000;
         uint8_t* memory = new uint8_t[memory_len];
-        SortManager manager(memory, memory_len, 16, 4, size, ".", "test-files", 0, 1);
+        SortManager manager(memory, memory_len, 16, 4, size, ".", "test-files", 0, 1, nullptr);
         int total_written_1 = 0;
         for (uint32_t i = 0; i < iters; i++) {
             vector<unsigned char> hash_input = intToBytes(i, 4);
@@ -820,7 +820,7 @@ TEST_CASE("Sort on disk")
 
         const uint32_t memory_len = Util::RoundSize(iters) * 30;
         uint8_t* memory = new uint8_t[memory_len];
-        UniformSort::SortToMemory(disk, begin, memory, size, iters, 16);
+        UniformSort::SortToMemory(disk, begin, memory, size, iters, 16, nullptr);
 
         sort(input.begin(), input.end());
         uint8_t buf[size];
