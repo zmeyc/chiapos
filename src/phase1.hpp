@@ -17,7 +17,6 @@
 
 #ifndef _WIN32
 #include <semaphore.h>
-#include <unistd.h>
 #endif
 
 #include <math.h>
