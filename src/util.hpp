@@ -353,40 +353,6 @@ namespace Util {
 #endif
     }
 
-    int lock_directory(
-        std::string dirname)
-    {
-        int dir_fd = open(dirname.c_str(), O_RDONLY | O_NOCTTY);
-        if (dir_fd == -1) {
-            std::cerr << "Unable to open directory for locking: " << dirname
-                << ". Error: " << strerror(errno) << std::endl;
-            return -1;
-        }
-        while (0 != flock(dir_fd, LOCK_EX | LOCK_NB)) {
-            if (EWOULDBLOCK == errno) {
-                std::cout << "Directory locked, waiting (retrying in 1 minute): " << dirname << std::endl;
-            } else {
-                std::cerr << "Unable to lock directory (retrying in 1 minute): "
-                    << ". Error: " << strerror(errno) << std::endl;
-            }
-            sleep_seconds(1 * 60);
-        }
-        return dir_fd;
-    }
-
-    void unlock_directory(
-        int dir_fd,
-        std::string dirname)
-    {
-        if (-1 == flock(dir_fd, LOCK_UN)) {
-            std::cerr << "Failed to unlock the directory: " << dirname
-                << ". Error: " << strerror(errno) << std::endl;
-        }
-        if (-1 == close(dir_fd)) {
-            std::cerr << "Failed to close the directory during unlocking: " << dirname
-                << ". Error: " << strerror(errno) << std::endl;
-        }
-	}
 }
 
 #endif  // SRC_CPP_UTIL_HPP_

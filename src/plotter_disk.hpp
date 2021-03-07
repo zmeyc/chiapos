@@ -47,6 +47,7 @@
 #include "pos_constants.hpp"
 #include "sort_manager.hpp"
 #include "util.hpp"
+#include "disk_util.hpp"
 
 #define B17PHASE23
 
@@ -367,12 +368,13 @@ public:
                 }
             } else {
                 if (!bCopied) {
-                    int dir_fd = Util::lock_directory(final_dirname);
+                    bool should_lock = DiskUtil::ShouldLock(final_dirname);
+
+                    DirectoryLock dir_lock(final_dirname, should_lock);
                     fs::copy(
                         tmp_2_filename, final_2_filename, fs::copy_options::overwrite_existing, ec);
-                    if (dir_fd != -1) {
-                        Util::unlock_directory(dir_fd, final_dirname);
-                    }
+                    dir_lock.Unlock();
+                    
                     if (ec.value() != 0) {
                         std::cout << "Could not copy " << tmp_2_filename << " to "
                                   << final_2_filename << ". Error " << ec.message()
