@@ -73,7 +73,9 @@ public:
         uint64_t stripe_size_input = 0,
         uint8_t num_threads_input = 0,
         bool nobitfield = false,
-        bool show_progress = false)
+        bool show_progress = false,
+        std::string runtime_dir = ".",
+        uint32_t phase1_max_processes = 0)
     {
         // Increases the open file limit, we will open a lot of files.
 #ifndef _WIN32
@@ -217,12 +219,18 @@ public:
 
             assert(id_len == kIdLen);
 
+            if (phase1_max_processes > 0) {
+                std::cout << std::endl;
+            }
+            MultiFileLock lock(runtime_dir, "phase1", phase1_max_processes);
+
             std::cout << std::endl
                       << "Starting phase 1/4: Forward Propagation into tmp files... "
                       << Timer::GetNow();
 
-            Timer p1;
             Timer all_phases;
+
+            Timer p1;
             std::vector<uint64_t> table_sizes = RunPhase1(
                 tmp_1_disks,
                 k,
@@ -236,6 +244,8 @@ public:
                 num_threads,
                 show_progress);
             p1.PrintElapsed("Time for phase 1 =");
+
+            lock.Unlock();
 
             uint64_t finalsize=0;
 
