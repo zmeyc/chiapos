@@ -58,6 +58,8 @@ class TestPythonBindings(unittest.TestCase):
             8192,
             8,
             False,
+            ".",
+            0
         )
         pl = None
 
